@@ -79,6 +79,7 @@ INSTALLED_APPS = (
     'admin.metrics',
     'admin.nodes',
     'admin.users',
+    'admin.desk',
     'admin.meetings',
     'admin.sales_analytics',
 
@@ -86,16 +87,19 @@ INSTALLED_APPS = (
     'raven.contrib.django.raven_compat',
     'webpack_loader',
     'django_nose',
-    'ckeditor',
     'password_reset',
+
+    'osf'
 )
+
+USE_TZ = True
 
 # local development using https
 if osf_settings.SECURE_MODE and osf_settings.DEBUG_MODE:
     INSTALLED_APPS += ('sslserver',)
 
 # Custom user model (extends AbstractBaseUser)
-AUTH_USER_MODEL = 'common_auth.MyUser'
+AUTH_USER_MODEL = 'osf.OSFUser'
 
 # TODO: Are there more granular ways to configure reporting specifically related to the API?
 RAVEN_CONFIG = {
@@ -118,9 +122,7 @@ MIDDLEWARE_CLASSES = (
     # even in the event of a redirect. CommonMiddleware may cause other middlewares'
     # process_request to be skipped, e.g. when a trailing slash is omitted
     'api.base.middleware.DjangoGlobalMiddleware',
-    'api.base.middleware.MongoConnectionMiddleware',
     'api.base.middleware.CeleryTaskMiddleware',
-    'api.base.middleware.TokuTransactionMiddleware',
 
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -154,26 +156,20 @@ TEMPLATES = [
     }]
 
 # Database
+# https://docs.djangoproject.com/en/1.8/ref/settings/#databases
 # Postgres:
-# DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.postgresql_psycopg2',
-#         'NAME': local.POSTGRES_NAME,
-#         'USER': local.POSTGRES_USER,
-#         'PASSWORD': local.POSTGRES_PASSWORD,
-#         'HOST': local.POSTGRES_HOST,
-#         'PORT': '',
-#     }
-# }
-# Postgres settings in local.py
-
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
+        'CONN_MAX_AGE': 0,
+        'ENGINE': 'osf.db.backends.postgresql',  # django.db.backends.postgresql
+        'NAME': os.environ.get('OSF_DB_NAME', 'osf'),
+        'USER': os.environ.get('OSF_DB_USER', 'postgres'),
+        'PASSWORD': os.environ.get('OSF_DB_PASSWORD', ''),
+        'HOST': os.environ.get('OSF_DB_HOST', '127.0.0.1'),
+        'PORT': os.environ.get('OSF_DB_PORT', '5432'),
+        'ATOMIC_REQUESTS': True,
     }
 }
-# https://docs.djangoproject.com/en/1.8/ref/settings/#databases
 
 ROOT_URLCONF = 'admin.base.urls'
 WSGI_APPLICATION = 'admin.base.wsgi.application'
@@ -204,18 +200,6 @@ WEBPACK_LOADER = {
 TEST_RUNNER = 'django_nose.NoseTestSuiteRunner'
 NOSE_ARGS = ['--verbosity=2']
 
-CKEDITOR_CONFIGS = {
-    'default': {
-        'toolbar': 'Custom',
-        'toolbar_Custom': [
-            ['Source'],
-            ['Bold', 'Italic', 'Underline'],
-            ['NumberedList', 'BulletedList'],
-            ['Link']
-        ]
-    },
-}
-
 # Keen.io settings in local.py
 KEEN_PROJECT_ID = osf_settings.KEEN['private']['project_id']
 KEEN_READ_KEY = osf_settings.KEEN['private']['read_key']
@@ -235,3 +219,7 @@ if KEEN_CREDENTIALS['keen_ready']:
 
 ENTRY_POINTS = {'osf4m': 'osf4m', 'prereg_challenge_campaign': 'prereg',
                 'institution_campaign': 'institution'}
+
+# Set in local.py
+DESK_KEY = ''
+DESK_KEY_SECRET = ''

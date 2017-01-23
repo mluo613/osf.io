@@ -10,7 +10,7 @@ import requests
 
 from framework.auth import User
 from framework.auth import authenticate, external_first_login_authenticate
-from framework.auth.core import get_user
+from framework.auth.core import get_user, generate_verification_key
 from framework.flask import redirect
 from framework.exceptions import HTTPError
 from website import settings
@@ -60,11 +60,26 @@ class CasClient(object):
     def __init__(self, base_url):
         self.BASE_URL = base_url
 
-    def get_login_url(self, service_url, username=None, verification_key=None):
+    def get_login_url(self, service_url, campaign=None, username=None, verification_key=None):
+        """
+        Get CAS login url with `service_url` as redirect location. There are three options:
+        1. no additional parameters provided -> go to CAS login page
+        2. `campaign=institution` -> go to CAS institution login page
+        3. `(username, verification_key)` -> CAS will verify this request automatically in background
+
+        :param service_url: redirect url after successful login
+        :param campaign: the campaign name, currently 'institution' only
+        :param username: the username
+        :param verification_key: the verification key
+        :return: dedicated CAS login url
+        """
+
         url = furl.furl(self.BASE_URL)
         url.path.segments.append('login')
         url.args['service'] = service_url
-        if username and verification_key:
+        if campaign:
+            url.args['campaign'] = campaign
+        elif username and verification_key:
             url.args['username'] = username
             url.args['verification_key'] = verification_key
         return url.url
@@ -240,6 +255,8 @@ def make_response_from_ticket(ticket, service_url):
     """
 
     service_furl = furl.furl(service_url)
+    # `service_url` is guaranteed to be removed of `ticket` parameter, which has been pulled off in
+    # `framework.sessions.before_request()`.
     if 'ticket' in service_furl.args:
         service_furl.args.pop('ticket')
     client = get_client()
@@ -252,6 +269,20 @@ def make_response_from_ticket(ticket, service_url):
             if user.verification_key:
                 user.verification_key = None
                 user.save()
+
+            # if user is authenticated by external IDP, ask CAS to authenticate user for a second time
+            # this extra step will guarantee that 2FA are enforced
+            # current CAS session created by external login must be cleared first before authentication
+            if external_credential:
+                user.verification_key = generate_verification_key()
+                user.save()
+                return redirect(get_logout_url(get_login_url(
+                    service_url,
+                    username=user.username,
+                    verification_key=user.verification_key
+                )))
+
+            # if user is authenticated by CAS
             return authenticate(
                 user,
                 cas_resp.attributes['accessToken'],
@@ -260,12 +291,16 @@ def make_response_from_ticket(ticket, service_url):
         # first time login from external identity provider
         if not user and external_credential and action == 'external_first_login':
             from website.util import web_url_for
-            # TODO: [#OSF-6935] verify both names are in attributes, which should be handled in CAS
+            # orcid attributes can be marked private and not shared, default to orcid otherwise
+            fullname = u'{} {}'.format(cas_resp.attributes.get('given-names', ''), cas_resp.attributes.get('family-name', '')).strip()
+            if not fullname:
+                fullname = external_credential['id']
             user = {
                 'external_id_provider': external_credential['provider'],
                 'external_id': external_credential['id'],
-                'fullname': '{} {}'.format(cas_resp.attributes.get('given-names', ''), cas_resp.attributes.get('family-name', '')),
+                'fullname': fullname,
                 'access_token': cas_resp.attributes['accessToken'],
+                'service_url': service_furl.url,
             }
             return external_first_login_authenticate(
                 user,
@@ -278,13 +313,15 @@ def make_response_from_ticket(ticket, service_url):
 def get_user_from_cas_resp(cas_resp):
     """
     Given a CAS service validation response, attempt to retrieve user information and next action.
+    The `user` in `cas_resp` is the unique GUID of the user. Please do not use the primary key `id`
+    or the email `username`. This holds except for the first step of ORCiD login.
 
     :param cas_resp: the cas service validation response
     :return: the user, the external_credential, and the next action
     """
 
     if cas_resp.user:
-        user = User.load(cas_resp.user)
+        user = User.objects.filter(guids___id=cas_resp.user).first()
         # cas returns a valid OSF user id
         if user:
             return user, None, 'authenticate'

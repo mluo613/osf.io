@@ -1,26 +1,15 @@
-from django.views.generic import ListView
-from django.shortcuts import redirect
-from django.core.urlresolvers import reverse
-from djqscsv import render_to_csv_response
+from django.views.generic import TemplateView
 
-from admin.metrics.models import OSFWebsiteStatistics
-from admin.metrics.utils import get_osf_statistics
+from admin.base.settings import KEEN_CREDENTIALS
 
 
-def update_metrics(request):
-    get_osf_statistics()
-    return redirect(reverse('metrics:stats_list'))
+from admin.base.utils import OSFAdmin
 
 
-def download_csv(request):
-    queryset = OSFWebsiteStatistics.objects.all().order_by('-date')
-    return render_to_csv_response(queryset)
+class MetricsView(OSFAdmin, TemplateView):
+    template_name = 'metrics/osf_metrics.html'
 
+    def get_context_data(self, **kwargs):
 
-class OSFStatisticsListView(ListView):
-    model = OSFWebsiteStatistics
-    template_name = 'metrics/osf_statistics.html'
-    context_object_name = 'metrics'
-    paginate_by = 50
-    paginate_orphans = 5
-    ordering = '-date'
+        kwargs.update(KEEN_CREDENTIALS.copy())
+        return super(MetricsView, self).get_context_data(**kwargs)

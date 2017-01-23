@@ -1,70 +1,63 @@
 # -*- coding: utf-8 -*-
 '''Unit tests for models and their factories.'''
-import mock
-import unittest
-from nose.tools import *  # noqa (PEP8 asserts)
-
-import pytz
 import datetime
-import urlparse
-import urllib
-import itsdangerous
+import json
+import os.path
 import random
 import string
-from dateutil import parser
+import unittest
+import urllib
+import urlparse
 
+import itsdangerous
+import mock
+import pytz
+from dateutil import parser
+from django.utils import timezone
+from framework.analytics import get_total_activity_count
+from framework.auth import exceptions as auth_exc
+from framework.auth import Auth, User, cas
+from framework.auth.exceptions import ChangePasswordError, ExpiredTokenError
+from framework.auth.signals import user_merged
+from framework.auth.utils import impute_names_model
+from framework.bcrypt import check_password_hash
+from framework.celery_tasks import handlers
+from framework.exceptions import PermissionsError
+from framework.sessions import set_session
+from framework.sessions.model import Session
 from modularodm import Q
 from modularodm.exceptions import ValidationError, ValidationValueError
-
-
-from framework.analytics import get_total_activity_count
-from framework.exceptions import PermissionsError
-from framework.auth import User, Auth
-from framework.auth import cas
-from framework.sessions.model import Session
-from framework.auth import exceptions as auth_exc
-from framework.auth.exceptions import ChangePasswordError, ExpiredTokenError
-from framework.auth.utils import impute_names_model
-from framework.auth.signals import user_merged
-from framework.celery_tasks import handlers
-from framework.bcrypt import check_password_hash
-from website import filters, language, settings, mailchimp_utils
-from website.addons.wiki.model import NodeWikiPage
-from website.exceptions import NodeStateError, TagNotFoundError
-from website.profile.utils import serialize_user
-from website.project.signals import contributor_added
-from website.project.model import (
-    Node, NodeLog, Pointer, ensure_schemas, has_anonymous_link,
-    get_pointer_parent, MetaSchema, DraftRegistration
-)
-from website.util.permissions import (
-    CREATOR_PERMISSIONS,
-    ADMIN,
-    READ,
-    WRITE,
-    DEFAULT_CONTRIBUTOR_PERMISSIONS,
-    expand_permissions,
-)
-from website.util import web_url_for, api_url_for
-from website.addons.wiki.exceptions import (
-    NameEmptyError,
-    NameInvalidError,
-    NameMaximumLengthError,
-    PageCannotRenameError,
-    PageConflictError,
-    PageNotFoundError,
-)
-
-from tests.base import OsfTestCase, Guid, fake, capture_signals, get_default_metaschema
-from tests.factories import (
-    UserFactory, ApiOAuth2ApplicationFactory, NodeFactory, PointerFactory,
-    ProjectFactory, NodeLogFactory, WatchConfigFactory,
-    NodeWikiFactory, RegistrationFactory, UnregUserFactory,
-    ProjectWithAddonFactory, UnconfirmedUserFactory, PrivateLinkFactory,
-    AuthUserFactory, BookmarkCollectionFactory, CollectionFactory,
-    NodeLicenseRecordFactory, InstitutionFactory, CommentFactory
-)
+from nose.tools import *  # noqa (PEP8 asserts)
+from tests.base import (Guid, OsfTestCase, capture_signals, fake,
+                        get_default_metaschema)
+from tests.factories import (ApiOAuth2ApplicationFactory, AuthUserFactory,
+                             BookmarkCollectionFactory, CollectionFactory,
+                             CommentFactory, InstitutionFactory, NodeFactory,
+                             NodeLicenseRecordFactory, NodeLogFactory,
+                             NodeWikiFactory, PointerFactory,
+                             PrivateLinkFactory, ProjectFactory,
+                             ProjectWithAddonFactory, RegistrationFactory,
+                             SessionFactory, UnconfirmedUserFactory,
+                             UnregUserFactory, UserFactory, WatchConfigFactory)
 from tests.utils import mock_archive
+from website import filters, language, mailchimp_utils, settings
+from addons.wiki.exceptions import (NameEmptyError, NameInvalidError,
+                                            NameMaximumLengthError,
+                                            PageCannotRenameError,
+                                            PageConflictError,
+                                            PageNotFoundError)
+from addons.wiki.models import NodeWikiPage
+from website.exceptions import NodeStateError, TagNotFoundError
+from website.project.model import (DraftRegistration, MetaSchema, Node,
+                                   NodeLog, Pointer, ensure_schemas,
+                                   get_pointer_parent, has_anonymous_link)
+from website.project.signals import contributor_added
+from website.project.spam.model import SpamStatus
+from website.project.tasks import on_node_updated
+from website.util import api_url_for, web_url_for
+from website.util.permissions import (ADMIN, CREATOR_PERMISSIONS,
+                                      DEFAULT_CONTRIBUTOR_PERMISSIONS, READ,
+                                      WRITE, expand_permissions)
 
 GUID_FACTORIES = UserFactory, NodeFactory, ProjectFactory
 
@@ -90,35 +83,32 @@ class TestUserValidation(OsfTestCase):
         self.user.save()
         assert_equal(self.user.social['profileWebsites'], [])
 
-    def test_validate_social_valid_website_simple(self):
-        self.user.social = {'profileWebsites': ['http://cos.io/']}
-        self.user.save()
-        assert_equal(self.user.social['profileWebsites'], ['http://cos.io/'])
+    def test_validate_social_profile_website_many_different(self):
+        basepath = os.path.dirname(__file__)
+        url_data_path = os.path.join(basepath, '../website/static/urlValidatorTest.json')
+        with open(url_data_path) as url_test_data:
+            data = json.load(url_test_data)
 
-    def test_validate_social_valid_website_protocol(self):
-        self.user.social = {'profileWebsites': ['https://definitelyawebsite.com']}
-        self.user.save()
-        assert_equal(self.user.social['profileWebsites'], ['https://definitelyawebsite.com'])
+        fails_at_end = False
+        for should_pass in data["testsPositive"]:
+            try:
+                self.user.social = {'profileWebsites': [should_pass]}
+                self.user.save()
+                assert_equal(self.user.social['profileWebsites'], [should_pass])
+            except ValidationError:
+                fails_at_end = True
+                print('\"' + should_pass + '\" failed but should have passed while testing that the validator ' + data['testsPositive'][should_pass])
 
-    def test_validate_social_valid_website_ipv4(self):
-        self.user.social = {'profileWebsites': ['http://127.0.0.1']}
-        self.user.save()
-        assert_equal(self.user.social['profileWebsites'], ['http://127.0.0.1'])
-
-    def test_validate_social_valid_website_path(self):
-        self.user.social = {'profileWebsites': ['http://definitelyawebsite.com/definitelyapage/']}
-        self.user.save()
-        assert_equal(self.user.social['profileWebsites'], ['http://definitelyawebsite.com/definitelyapage/'])
-
-    def test_validate_social_valid_website_portandpath(self):
-        self.user.social = {'profileWebsites': ['http://127.0.0.1:5000/hello/']}
-        self.user.save()
-        assert_equal(self.user.social['profileWebsites'], ['http://127.0.0.1:5000/hello/'])
-
-    def test_validate_social_valid_website_querystrings(self):
-        self.user.social = {'profileWebsites': ['http://definitelyawebsite.com?real=yes&page=definitely']}
-        self.user.save()
-        assert_equal(self.user.social['profileWebsites'], ['http://definitelyawebsite.com?real=yes&page=definitely'])
+        for should_fail in data["testsNegative"]:
+            self.user.social = {'profileWebsites': [should_fail]}
+            try:
+                with assert_raises(ValidationError):
+                    self.user.save()
+            except AssertionError:
+                fails_at_end = True
+                print('\"' + should_fail + '\" passed but should have failed while testing that the validator ' + data['testsNegative'][should_fail])
+        if fails_at_end:
+            raise
 
     def test_validate_multiple_profile_websites_valid(self):
         self.user.social = {'profileWebsites': ['http://cos.io/', 'http://thebuckstopshere.com', 'http://dinosaurs.com']}
@@ -445,6 +435,11 @@ class TestUser(OsfTestCase):
             self.user.add_unconfirmed_email('')
         assert_equal(exc_info.exception.message, "Invalid Email")
 
+    def test_add_blacklisted_domain_unconfirmed_email(self):
+        with assert_raises(ValidationError) as e:
+            self.user.add_unconfirmed_email('kanye@mailinator.com')
+        assert_equal(e.exception.message, 'Invalid Email')
+
     @mock.patch('website.security.random_string')
     def test_get_confirmation_token(self, random_string):
         random_string.return_value = '12345'
@@ -456,7 +451,7 @@ class TestUser(OsfTestCase):
     def test_get_confirmation_token_when_token_is_expired_raises_error(self):
         u = UserFactory()
         # Make sure token is already expired
-        expiration = datetime.datetime.utcnow() - datetime.timedelta(seconds=1)
+        expiration = timezone.now() - datetime.timedelta(seconds=1)
         u.add_unconfirmed_email('foo@bar.com', expiration=expiration)
 
         with assert_raises(ExpiredTokenError):
@@ -467,7 +462,7 @@ class TestUser(OsfTestCase):
         random_string.return_value = '12345'
         u = UserFactory()
         # Make sure token is already expired
-        expiration = datetime.datetime.utcnow() - datetime.timedelta(seconds=1)
+        expiration = timezone.now() - datetime.timedelta(seconds=1)
         u.add_unconfirmed_email('foo@bar.com', expiration=expiration)
 
         # sanity check
@@ -506,14 +501,14 @@ class TestUser(OsfTestCase):
     def test_get_confirmation_url_for_external_service(self, random_string):
         random_string.return_value = 'abcde'
         u = UnconfirmedUserFactory()
-        assert_equal(u.get_confirmation_url(u.username, external_id_provider='service'),
-                '{0}confirm/external/{1}/{2}/'.format(settings.DOMAIN, u._id, 'abcde'))
+        assert_equal(u.get_confirmation_url(u.username, external_id_provider='service', destination='dashboard'),
+                '{0}confirm/external/{1}/{2}/?destination={3}'.format(settings.DOMAIN, u._id, 'abcde', 'dashboard'))
 
 
     def test_get_confirmation_url_when_token_is_expired_raises_error(self):
         u = UserFactory()
         # Make sure token is already expired
-        expiration = datetime.datetime.utcnow() - datetime.timedelta(seconds=1)
+        expiration = timezone.now() - datetime.timedelta(seconds=1)
         u.add_unconfirmed_email('foo@bar.com', expiration=expiration)
 
         with assert_raises(ExpiredTokenError):
@@ -524,7 +519,7 @@ class TestUser(OsfTestCase):
         random_string.return_value = '12345'
         u = UserFactory()
         # Make sure token is already expired
-        expiration = datetime.datetime.utcnow() - datetime.timedelta(seconds=1)
+        expiration = timezone.now() - datetime.timedelta(seconds=1)
         u.add_unconfirmed_email('foo@bar.com', expiration=expiration)
 
         # sanity check
@@ -558,8 +553,8 @@ class TestUser(OsfTestCase):
 
         valid_token = u.get_confirmation_token('foo@bar.com')
         assert_true(u.get_unconfirmed_email_for_token(valid_token))
-        manual_expiration = datetime.datetime.utcnow() - datetime.timedelta(0, 10)
-        u._set_email_token_expiration(valid_token, expiration=manual_expiration)
+        manual_expiration = timezone.now() - datetime.timedelta(0, 10)
+        u.email_verifications[valid_token]['expiration'] = manual_expiration
 
         with assert_raises(auth_exc.ExpiredTokenError):
             u.get_unconfirmed_email_for_token(valid_token)
@@ -583,8 +578,8 @@ class TestUser(OsfTestCase):
         user = UserFactory()
         assert_equal(User.find().count(), 1)
         assert_true(user.username)
-        another_user = UserFactory(username='joe@example.com')
-        assert_equal(another_user.username, 'joe@example.com')
+        another_user = UserFactory(username='joe@mail.com')
+        assert_equal(another_user.username, 'joe@mail.com')
         assert_equal(User.find().count(), 2)
         assert_true(user.date_registered)
 
@@ -726,55 +721,9 @@ class TestUser(OsfTestCase):
         assert_equal(self.user.get_activity_points(db=self.db),
                     get_total_activity_count(self.user._primary_key))
 
-    def test_serialize_user(self):
-        master = UserFactory()
-        user = UserFactory.build()
-        master.merge_user(user)
-        d = serialize_user(user)
-        assert_equal(d['id'], user._primary_key)
-        assert_equal(d['url'], user.url)
-        assert_equal(d.get('username', None), None)
-        assert_equal(d['fullname'], user.fullname)
-        assert_equal(d['registered'], user.is_registered)
-        assert_equal(d['absolute_url'], user.absolute_url)
-        assert_equal(d['date_registered'], user.date_registered.strftime('%Y-%m-%d'))
-        assert_equal(d['active'], user.is_active)
-
-    def test_serialize_user_full(self):
-        master = UserFactory()
-        user = UserFactory.build()
-        master.merge_user(user)
-        d = serialize_user(user, full=True)
-        gravatar = filters.gravatar(
-            user,
-            use_ssl=True,
-            size=settings.PROFILE_IMAGE_LARGE
-        )
-        assert_equal(d['id'], user._primary_key)
-        assert_equal(d['url'], user.url)
-        assert_equal(d.get('username'), None)
-        assert_equal(d['fullname'], user.fullname)
-        assert_equal(d['registered'], user.is_registered)
-        assert_equal(d['gravatar_url'], gravatar)
-        assert_equal(d['absolute_url'], user.absolute_url)
-        assert_equal(d['date_registered'], user.date_registered.strftime('%Y-%m-%d'))
-        assert_equal(d['is_merged'], user.is_merged)
-        assert_equal(d['merged_by']['url'], user.merged_by.url)
-        assert_equal(d['merged_by']['absolute_url'], user.merged_by.absolute_url)
-        projects = [
-            node
-            for node in user.contributed
-            if node.category == 'project'
-            and not node.is_registration
-            and not node.is_deleted
-        ]
-        public_projects = [p for p in projects if p.is_public]
-        assert_equal(d['number_projects'], len(projects))
-        assert_equal(d['number_public_projects'], len(public_projects))
-
     def test_recently_added(self):
         # Project created
-        project = ProjectFactory()
+        project = ProjectFactory(creator=self.user)
 
         assert_true(hasattr(self.user, 'recently_added'))
 
@@ -794,8 +743,8 @@ class TestUser(OsfTestCase):
         user4 = UserFactory()
 
         # 2 projects created
-        project = ProjectFactory()
-        project2 = ProjectFactory()
+        project = ProjectFactory(creator=self.user)
+        project2 = ProjectFactory(creator=self.user)
 
         # Users 2 and 3 are added to original project
         project.add_contributor(contributor=user2, auth=self.auth)
@@ -812,7 +761,7 @@ class TestUser(OsfTestCase):
 
     def test_recently_added_length(self):
         # Project created
-        project = ProjectFactory()
+        project = ProjectFactory(creator=self.user)
 
         assert_equal(len(self.user.recently_added), 0)
         # Add 17 users
@@ -981,7 +930,10 @@ class TestDisablingUsers(OsfTestCase):
         assert_equal(new_date_disabled, old_date_disabled)
 
     @mock.patch('website.mailchimp_utils.get_mailchimp_api')
-    def test_disable_account(self, mock_mail):
+    def test_disable_account_and_remove_sessions(self, mock_mail):
+        session1 = SessionFactory(user=self.user, date_created=(timezone.now() - datetime.timedelta(seconds=settings.OSF_SESSION_TIMEOUT)))
+        session2 = SessionFactory(user=self.user, date_created=(timezone.now() - datetime.timedelta(seconds=settings.OSF_SESSION_TIMEOUT)))
+
         self.user.mailchimp_mailing_lists[settings.MAILCHIMP_GENERAL_LIST] = True
         self.user.save()
         self.user.disable_account()
@@ -989,6 +941,9 @@ class TestDisablingUsers(OsfTestCase):
         assert_true(self.user.is_disabled)
         assert_true(isinstance(self.user.date_disabled, datetime.datetime))
         assert_false(self.user.mailchimp_mailing_lists[settings.MAILCHIMP_GENERAL_LIST])
+
+        assert_false(Session.load(session1._id))
+        assert_false(Session.load(session2._id))
 
     def test_disable_account_api(self):
         settings.ENABLE_EMAIL_SUBSCRIPTIONS = True
@@ -1006,7 +961,7 @@ class TestMergingUsers(OsfTestCase):
         self.master = UserFactory(
             fullname='Joe Shmo',
             is_registered=True,
-            emails=['joe@example.com'],
+            emails=['joe@mail.com'],
         )
         self.dupe = UserFactory(
             fullname='Joseph Shmo',
@@ -1145,7 +1100,7 @@ class TestApiOAuth2Application(OsfTestCase):
 
     def test_cant_edit_creation_date(self):
         with assert_raises(AttributeError):
-            self.api_app.date_created = datetime.datetime.utcnow()
+            self.api_app.date_created = timezone.now()
 
     def test_invalid_home_url_raises_exception(self):
         with assert_raises(ValidationError):
@@ -1267,15 +1222,15 @@ class TestUpdateNodeWiki(OsfTestCase):
 
     def test_update_log(self):
         # Updates are logged
-        assert_equal(self.project.logs[-1].action, 'wiki_updated')
+        assert_equal(self.project.logs.latest().action, 'wiki_updated')
         # user updates the wiki a second time
         self.project.update_node_wiki('home', 'Hola mundo', self.auth)
         # There are two update logs
-        assert_equal([log.action for log in self.project.logs].count('wiki_updated'), 2)
+        assert_equal([log.action for log in self.project.logs.all()].count('wiki_updated'), 2)
 
     def test_update_log_specifics(self):
         page = self.project.get_wiki_page('home')
-        log = self.project.logs[-1]
+        log = self.project.logs.latest()
         assert_equal('wiki_updated', log.action)
         assert_equal(page._primary_key, log.params['page_id'])
 
@@ -1424,7 +1379,7 @@ class TestRenameNodeWiki(OsfTestCase):
         page = self.project.get_wiki_page(new_name)
         assert_not_equal(old_name, page.page_name)
         assert_equal(new_name, page.page_name)
-        assert_equal(self.project.logs[-1].action, NodeLog.WIKI_RENAMED)
+        assert_equal(self.project.logs.latest().action, NodeLog.WIKI_RENAMED)
 
     def test_rename_page_case_sensitive(self):
         old_name = 'new page'
@@ -1433,7 +1388,7 @@ class TestRenameNodeWiki(OsfTestCase):
         self.project.rename_node_wiki(old_name, new_name, self.auth)
         new_page = self.project.get_wiki_page(new_name)
         assert_equal(new_name, new_page.page_name)
-        assert_equal(self.project.logs[-1].action, NodeLog.WIKI_RENAMED)
+        assert_equal(self.project.logs.latest().action, NodeLog.WIKI_RENAMED)
 
     def test_rename_existing_deleted_page(self):
         old_name = 'old page'
@@ -1453,7 +1408,7 @@ class TestRenameNodeWiki(OsfTestCase):
         # renaming over an existing deleted page replaces it.
         assert_equal(new_content, old_page.content)
         assert_equal(new_content, new_page.content)
-        assert_equal(self.project.logs[-1].action, NodeLog.WIKI_RENAMED)
+        assert_equal(self.project.logs.latest().action, NodeLog.WIKI_RENAMED)
 
     def test_rename_page_conflict(self):
         existing_name = 'existing page'
@@ -1470,13 +1425,13 @@ class TestRenameNodeWiki(OsfTestCase):
         self.project.update_node_wiki('wiki', 'content', self.auth)
         self.project.rename_node_wiki('wiki', 'renamed wiki', self.auth)
         # Rename is logged
-        assert_equal(self.project.logs[-1].action, 'wiki_renamed')
+        assert_equal(self.project.logs.latest().action, 'wiki_renamed')
 
     def test_rename_log_specifics(self):
         self.project.update_node_wiki('wiki', 'content', self.auth)
         self.project.rename_node_wiki('wiki', 'renamed wiki', self.auth)
         page = self.project.get_wiki_page('renamed wiki')
-        log = self.project.logs[-1]
+        log = self.project.logs.latest()
         assert_equal('wiki_renamed', log.action)
         assert_equal(page._primary_key, log.params['page_id'])
 
@@ -1498,12 +1453,12 @@ class TestDeleteNodeWiki(OsfTestCase):
         # Delete wiki
         self.project.delete_node_wiki('home', self.auth)
         # Deletion is logged
-        assert_equal(self.project.logs[-1].action, 'wiki_deleted')
+        assert_equal(self.project.logs.latest().action, 'wiki_deleted')
 
     def test_delete_log_specifics(self):
         page = self.project.get_wiki_page('home')
         self.project.delete_node_wiki('home', self.auth)
-        log = self.project.logs[-1]
+        log = self.project.logs.latest()
         assert_equal('wiki_deleted', log.action)
         assert_equal(page._primary_key, log.params['page_id'])
 
@@ -1522,7 +1477,7 @@ class TestDeleteNodeWiki(OsfTestCase):
         # page was deleted
         assert_false(self.project.get_wiki_page('home'))
 
-        log = self.project.logs[-1]
+        log = self.project.logs.latest()
 
         # deletion was logged
         assert_equal(
@@ -1586,7 +1541,7 @@ class TestNode(OsfTestCase):
     def test_get_aggregate_logs_queryset_doesnt_return_hidden_logs(self):
         n_orig_logs = len(self.parent.get_aggregate_logs_queryset(Auth(self.user)))
 
-        log = self.parent.logs[-1]
+        log = self.parent.logs.latest()
         log.should_hide = True
         log.save()
 
@@ -1600,17 +1555,17 @@ class TestNode(OsfTestCase):
 
     def test_validate_bad_doi(self):
         with assert_raises(ValidationError):
-            Node(preprint_doi='nope').save()
+            Node(preprint_article_doi='nope').save()
         with assert_raises(ValidationError):
-            Node(preprint_doi='https://dx.doi.org/10.123.456').save()  # should save the bare DOI, not a URL
+            Node(preprint_article_doi='https://dx.doi.org/10.123.456').save()  # should save the bare DOI, not a URL
         with assert_raises(ValidationError):
-            Node(preprint_doi='doi:10.10.1038/nwooo1170').save()  # should save without doi: prefix
+            Node(preprint_article_doi='doi:10.10.1038/nwooo1170').save()  # should save without doi: prefix
 
     def test_validate_good_doi(self):
-        doi = '10.10.1038/nwooo1170'
-        self.node.preprint_doi = doi
+        doi = '10.11038/nwooo1170'
+        self.node.preprint_article_doi = doi
         self.node.save()
-        assert_equal(self.node.preprint_doi, doi)
+        assert_equal(self.node.preprint_article_doi, doi)
 
     def test_web_url_for(self):
         result = self.parent.web_url_for('view_project')
@@ -1713,7 +1668,7 @@ class TestNode(OsfTestCase):
             addon_record_count + 1
         )
         assert_equal(
-            self.node.logs[-1].action,
+            self.node.logs.latest().action,
             NodeLog.ADDON_ADDED
         )
 
@@ -1740,7 +1695,7 @@ class TestNode(OsfTestCase):
             addon_count - 1
         )
         assert_equal(
-            self.node.logs[-1].action,
+            self.node.logs.latest().action,
             NodeLog.ADDON_REMOVED
         )
 
@@ -1781,7 +1736,7 @@ class TestNode(OsfTestCase):
         assert_in(self.node, self.parent.nodes)
 
     def test_log(self):
-        latest_log = self.node.logs[-1]
+        latest_log = self.node.logs.latest()
         assert_equal(latest_log.action, 'project_created')
         assert_equal(latest_log.params, {
             'node': self.node._primary_key,
@@ -1798,10 +1753,10 @@ class TestNode(OsfTestCase):
         assert_equal(self.node.nodes[0].node, node2)
         assert_equal(len(node2.get_points()), 1)
         assert_equal(
-            self.node.logs[-1].action, NodeLog.POINTER_CREATED
+            self.node.logs.latest().action, NodeLog.POINTER_CREATED
         )
         assert_equal(
-            self.node.logs[-1].params, {
+            self.node.logs.latest().params, {
                 'parent_node': self.node.parent_id,
                 'node': self.node._primary_key,
                 'pointer': {
@@ -1857,10 +1812,10 @@ class TestNode(OsfTestCase):
         assert_equal(len(self.node.nodes), 0)
         assert_equal(len(node2.get_points()), 0)
         assert_equal(
-            self.node.logs[-1].action, NodeLog.POINTER_REMOVED
+            self.node.logs.latest().action, NodeLog.POINTER_REMOVED
         )
         assert_equal(
-            self.node.logs[-1].params, {
+            self.node.logs.latest().params, {
                 'parent_node': self.node.parent_id,
                 'node': self.node._primary_key,
                 'pointer': {
@@ -1897,10 +1852,10 @@ class TestNode(OsfTestCase):
         assert_true(self.node.nodes[-1].primary)
         assert_equal(self.node.nodes[-1], forked)
         assert_equal(
-            self.node.logs[-1].action, NodeLog.POINTER_FORKED
+            self.node.logs.latest().action, NodeLog.POINTER_FORKED
         )
         assert_equal(
-            self.node.logs[-1].params, {
+            self.node.logs.latest().params, {
                 'parent_node': self.node.parent_id,
                 'node': self.node._primary_key,
                 'pointer': {
@@ -2113,7 +2068,7 @@ class TestNodeUpdate(OsfTestCase):
         self.node.update({'title': new_title}, auth=Auth(self.user), save=True)
         assert_equal(self.node.title, new_title)
 
-        last_log = self.node.logs[-1]
+        last_log = self.node.logs.latest()
         assert_equal(last_log.action, NodeLog.EDITED_TITLE)
 
         # Write contrib can update
@@ -2130,7 +2085,7 @@ class TestNodeUpdate(OsfTestCase):
         self.node.update({'title': new_title}, auth=Auth(self.user))
         assert_equal(self.node.title, new_title)
 
-        last_log = self.node.logs[-1]
+        last_log = self.node.logs.latest()
         assert_equal(last_log.action, NodeLog.EDITED_TITLE)
 
     def test_update_title_and_category(self):
@@ -2142,7 +2097,7 @@ class TestNodeUpdate(OsfTestCase):
         assert_equal(self.node.title, new_title)
         assert_equal(self.node.category, 'data')
 
-        penultimate_log, last_log = self.node.logs[-2], self.node.logs[-1]
+        penultimate_log, last_log = self.node.logs[-2], self.node.logs.latest()
         assert_equal(penultimate_log.action, NodeLog.EDITED_TITLE)
         assert_equal(last_log.action, NodeLog.UPDATED_FIELDS)
 
@@ -2150,11 +2105,11 @@ class TestNodeUpdate(OsfTestCase):
         self.node.update({'is_public': True}, auth=Auth(self.user), save=True)
         assert_true(self.node.is_public)
 
-        last_log = self.node.logs[-1]
+        last_log = self.node.logs.latest()
         assert_equal(last_log.action, NodeLog.MADE_PUBLIC)
 
         self.node.update({'is_public': False}, auth=Auth(self.user), save=True)
-        last_log = self.node.logs[-1]
+        last_log = self.node.logs.latest()
         assert_equal(last_log.action, NodeLog.MADE_PRIVATE)
 
     def test_update_can_make_registration_public(self):
@@ -2162,7 +2117,7 @@ class TestNodeUpdate(OsfTestCase):
         reg.update({'is_public': True})
 
         assert_true(reg.is_public)
-        last_log = reg.logs[-1]
+        last_log = reg.logs.latest()
         assert_equal(last_log.action, NodeLog.MADE_PUBLIC)
 
     def test_updating_title_twice_with_same_title(self):
@@ -2261,7 +2216,7 @@ class TestNodeTraversals(OsfTestCase):
         child = ProjectFactory(creator=self.viewer, parent=parent)
         child_non_admin = UserFactory()
         child.add_contributor(child_non_admin,
-                              auth=self.auth,
+                              auth=Auth(self.viewer),
                               permissions=expand_permissions(WRITE))
         grandchild = ProjectFactory(creator=self.user, parent=child)
 
@@ -2283,7 +2238,7 @@ class TestNodeTraversals(OsfTestCase):
         child = ProjectFactory(creator=self.viewer, parent=parent)
         child_non_admin = UserFactory()
         child.add_contributor(child_non_admin,
-                              auth=self.auth,
+                              auth=Auth(self.viewer),
                               permissions=expand_permissions(WRITE))
         grandchild = ProjectFactory(creator=self.user, parent=child)  # noqa
 
@@ -2304,7 +2259,7 @@ class TestNodeTraversals(OsfTestCase):
         child = ProjectFactory(creator=self.viewer, parent=parent)
         child_non_admin = UserFactory()
         child.add_contributor(child_non_admin,
-                              auth=self.auth,
+                              auth=Auth(self.viewer),
                               permissions=expand_permissions(WRITE))
         child.save()
 
@@ -2325,7 +2280,7 @@ class TestNodeTraversals(OsfTestCase):
         child = ProjectFactory(creator=self.viewer, parent=parent)
         child_non_admin = UserFactory()
         child.add_contributor(child_non_admin,
-                              auth=self.auth,
+                              auth=Auth(self.viewer),
                               permissions=expand_permissions(WRITE))
         child.save()
 
@@ -2406,7 +2361,7 @@ class TestRemoveNode(OsfTestCase):
 
         assert_true(self.parent_project.is_deleted)
         # parent node should have a log of the event
-        assert_equal(self.parent_project.logs[-1].action, 'project_deleted')
+        assert_equal(self.parent_project.logs.latest().action, 'project_deleted')
 
     def test_remove_project_with_project_child_fails(self):
         with assert_raises(NodeStateError):
@@ -2428,7 +2383,7 @@ class TestRemoveNode(OsfTestCase):
 
         assert_true(self.project.is_deleted)
         # parent node should have a log of the event
-        assert_equal(self.parent_project.logs[-1].action, 'node_removed')
+        assert_equal(self.parent_project.logs.latest().action, 'node_removed')
 
         # target node shouldn't be deleted
         assert_false(target.is_deleted)
@@ -2593,7 +2548,7 @@ class TestProject(OsfTestCase):
         assert_equal(node.category, 'project')
         assert_true(node._id)
         assert_almost_equal(
-            node.date_created, datetime.datetime.utcnow(),
+            node.date_created, timezone.now(),
             delta=datetime.timedelta(seconds=5),
         )
         assert_false(node.is_public)
@@ -2615,10 +2570,10 @@ class TestProject(OsfTestCase):
         assert_true(hasattr(node, 'nodes'))
         assert_true(hasattr(node, 'forked_from'))
         assert_true(hasattr(node, 'registered_from'))
-        assert_equal(node.logs[-1].action, 'project_created')
+        assert_equal(node.logs.latest().action, 'project_created')
 
     def test_log(self):
-        latest_log = self.project.logs[-1]
+        latest_log = self.project.logs.latest()
         assert_equal(latest_log.action, 'project_created')
         assert_equal(latest_log.params['node'], self.project._primary_key)
         assert_equal(latest_log.user, self.user)
@@ -2657,7 +2612,7 @@ class TestProject(OsfTestCase):
         self.project.add_contributor(contributor=user2, auth=self.auth)
         self.project.save()
         assert_in(user2, self.project.contributors)
-        assert_equal(self.project.logs[-1].action, 'contributor_added')
+        assert_equal(self.project.logs.latest().action, 'contributor_added')
 
     def test_add_contributor_sends_contributor_added_signal(self):
         user = UserFactory()
@@ -2686,7 +2641,7 @@ class TestProject(OsfTestCase):
         assert_false(latest_contributor.is_registered)
 
         # A log event was added
-        assert_equal(self.project.logs[-1].action, 'contributor_added')
+        assert_equal(self.project.logs.latest().action, 'contributor_added')
         assert_in(self.project._primary_key, latest_contributor.unclaimed_records,
             'unclaimed record was added')
         unclaimed_data = latest_contributor.get_unclaimed_record(self.project._primary_key)
@@ -2733,8 +2688,8 @@ class TestProject(OsfTestCase):
 
         assert_not_in(user2, self.project.contributors)
         assert_not_in(user2._id, self.project.permissions)
-        assert_equal(self.project.logs[-1].action, 'contributor_removed')
-        assert_equal(self.project.logs[-1].params['contributors'], [user2._id])
+        assert_equal(self.project.logs.latest().action, 'contributor_removed')
+        assert_equal(self.project.logs.latest().params['contributors'], [user2._id])
 
     def test_manage_contributors_cannot_remove_last_admin_contributor(self):
         user2 = UserFactory()
@@ -2769,7 +2724,7 @@ class TestProject(OsfTestCase):
             auth=self.auth,
             save=True
         )
-        latest_log = self.project.logs[-1]
+        latest_log = self.project.logs.latest()
         assert_equal(latest_log.action, NodeLog.CONTRIB_REORDERED)
         assert_equal(latest_log.user, self.user)
         assert_in(self.user._id, latest_log.params['contributors'])
@@ -2878,7 +2833,7 @@ class TestProject(OsfTestCase):
         # Title was changed
         assert_equal(proj.title, 'This is now')
         # A log event was saved
-        latest_log = proj.logs[-1]
+        latest_log = proj.logs.latest()
         assert_equal(latest_log.action, 'edit_title')
         assert_equal(latest_log.params['title_original'], 'That Was Then')
 
@@ -3205,7 +3160,7 @@ class TestProject(OsfTestCase):
         self.project.save()
         assert_equal(len(self.project.contributors), 3)
         assert_equal(
-            self.project.logs[-1].params['contributors'],
+            self.project.logs.latest().params['contributors'],
             [user1._id, user2._id]
         )
         assert_in(user1._id, self.project.permissions)
@@ -3215,7 +3170,7 @@ class TestProject(OsfTestCase):
         assert_equal(self.project.permissions[user1._id], ['read', 'write', 'admin'])
         assert_equal(self.project.permissions[user2._id], ['read', 'write'])
         assert_equal(
-            self.project.logs[-1].params['contributors'],
+            self.project.logs.latest().params['contributors'],
             [user1._id, user2._id]
         )
 
@@ -3223,12 +3178,12 @@ class TestProject(OsfTestCase):
         self.project.set_privacy('public', auth=self.auth)
         self.project.save()
         assert_true(self.project.is_public)
-        assert_equal(self.project.logs[-1].action, 'made_public')
+        assert_equal(self.project.logs.latest().action, 'made_public')
         assert_not_equal(self.project.keenio_read_key, '')
         self.project.set_privacy('private', auth=self.auth)
         self.project.save()
         assert_false(self.project.is_public)
-        assert_equal(self.project.logs[-1].action, NodeLog.MADE_PRIVATE)
+        assert_equal(self.project.logs.latest().action, NodeLog.MADE_PRIVATE)
         assert_equals(self.project.keenio_read_key, '')
 
     @mock.patch('website.mails.queue_mail')
@@ -3253,7 +3208,7 @@ class TestProject(OsfTestCase):
         registration = RegistrationFactory(project=self.project)
         registration.embargo_registration(
             self.user,
-            datetime.datetime.utcnow() + datetime.timedelta(days=10)
+            timezone.now() + datetime.timedelta(days=10)
         )
         assert_true(registration.is_pending_embargo)
 
@@ -3268,7 +3223,7 @@ class TestProject(OsfTestCase):
         registration = RegistrationFactory(project=self.project)
         registration.embargo_registration(
             self.user,
-            datetime.datetime.utcnow() + datetime.timedelta(days=10)
+            timezone.now() + datetime.timedelta(days=10)
         )
         assert_equal(len([a for a in registration.get_admin_contributors_recursive(unique_users=True)]), 4)
         with mock.patch('website.project.model.Node.is_embargoed', mock.PropertyMock(return_value=True)):
@@ -3277,13 +3232,87 @@ class TestProject(OsfTestCase):
                     registration.set_privacy('public', auth=self.auth)
                     assert_equal(mock_request_embargo_termination.call_count, 1)
 
+    @mock.patch.object(settings, 'SPAM_FLAGGED_MAKE_NODE_PRIVATE', True)
+    def test_set_privacy_on_spammy_node(self):
+        with mock.patch.object(Node, 'is_spammy', mock.PropertyMock(return_value=True)):
+            with assert_raises(NodeStateError):
+                self.project.set_privacy('public')
+
+    def test_check_spam_disabled_by_default(self):
+        # SPAM_CHECK_ENABLED is False by default
+        with mock.patch('website.project.model.Node._get_spam_content', mock.Mock(return_value='some content!')):
+            with mock.patch('website.project.model.Node.do_check_spam', mock.Mock(side_effect=Exception('should not get here'))):
+                self.project.set_privacy('public')
+                assert_false(self.project.check_spam(self.user, None, None))
+
+    @mock.patch.object(settings, 'SPAM_CHECK_ENABLED', True)
+    def test_check_spam_only_public_node_by_default(self):
+        # SPAM_CHECK_PUBLIC_ONLY is True by default
+        with mock.patch('website.project.model.Node._get_spam_content', mock.Mock(return_value='some content!')):
+            with mock.patch('website.project.model.Node.do_check_spam', mock.Mock(side_effect=Exception('should not get here'))):
+                self.project.set_privacy('private')
+                assert_false(self.project.check_spam(self.user, None, None))
+
+    @mock.patch.object(settings, 'SPAM_CHECK_ENABLED', True)
+    def test_check_spam_skips_ham_user(self):
+        with mock.patch('website.project.model.Node._get_spam_content', mock.Mock(return_value='some content!')):
+            with mock.patch('website.project.model.Node.do_check_spam', mock.Mock(side_effect=Exception('should not get here'))):
+                self.user.system_tags.extend(('ham_confirmed',))
+                self.project.set_privacy('public')
+                assert_false(self.project.check_spam(self.user, None, None))
+
+    @mock.patch.object(settings, 'SPAM_CHECK_ENABLED', True)
+    @mock.patch.object(settings, 'SPAM_CHECK_PUBLIC_ONLY', False)
+    def test_check_spam_on_private_node(self):
+        with mock.patch('website.project.model.Node._get_spam_content', mock.Mock(return_value='some content!')):
+            with mock.patch('website.project.model.Node.do_check_spam', mock.Mock(return_value=True)):
+                self.project.set_privacy('private')
+                assert_true(self.project.check_spam(self.user, None, None))
+
+    @mock.patch('website.project.model.mails.send_mail')
+    @mock.patch.object(settings, 'SPAM_CHECK_ENABLED', True)
+    @mock.patch.object(settings, 'SPAM_ACCOUNT_SUSPENSION_ENABLED', True)
+    def test_check_spam_on_private_node_bans_new_spam_user(self, mock_send_mail):
+        with mock.patch('website.project.model.Node._get_spam_content', mock.Mock(return_value='some content!')):
+            with mock.patch('website.project.model.Node.do_check_spam', mock.Mock(return_value=True)):
+                self.project.creator.date_confirmed = timezone.now()
+                self.project.set_privacy('public')
+                user2 = UserFactory()
+                # project w/ one contributor
+                project2 = ProjectFactory(creator=self.user, description='foobar2', is_public=True)
+                project2.save()
+                # project with more than one contributor
+                project3 = ProjectFactory(creator=self.user, description='foobar3', is_public=True)
+                project3.add_contributor(user2)
+                project3.save()
+
+                assert_true(self.project.check_spam(self.user, None, None))
+
+                assert_true(self.user.is_disabled)
+                assert_false(self.project.is_public)
+                project2.reload()
+                assert_false(project2.is_public)
+                project3.reload()
+                assert_true(project3.is_public)
+
+    @mock.patch('website.project.model.mails.send_mail')
+    @mock.patch.object(settings, 'SPAM_CHECK_ENABLED', True)
+    @mock.patch.object(settings, 'SPAM_ACCOUNT_SUSPENSION_ENABLED', True)
+    def test_check_spam_on_private_node_does_not_ban_existing_user(self, mock_send_mail):
+        with mock.patch('website.project.model.Node._get_spam_content', mock.Mock(return_value='some content!')):
+            with mock.patch('website.project.model.Node.do_check_spam', mock.Mock(return_value=True)):
+                self.project.creator.date_confirmed = timezone.now() - datetime.timedelta(days=9001)
+                self.project.set_privacy('public')
+                assert_true(self.project.check_spam(self.user, None, None))
+                assert_true(self.project.is_public)
+
     def test_set_description(self):
         old_desc = self.project.description
         self.project.set_description(
             'new description', auth=self.auth)
         self.project.save()
         assert_equal(self.project.description, 'new description')
-        latest_log = self.project.logs[-1]
+        latest_log = self.project.logs.latest()
         assert_equal(latest_log.action, NodeLog.EDITED_DESCRIPTION)
         assert_equal(latest_log.params['description_original'], old_desc)
         assert_equal(latest_log.params['description_new'], 'new description')
@@ -3296,7 +3325,7 @@ class TestProject(OsfTestCase):
             'new description', auth=self.auth)
         node.save()
         assert_equal(node.description, 'new description')
-        latest_log = node.logs[-1]
+        latest_log = node.logs.latest()
         assert_equal(latest_log.action, NodeLog.EDITED_DESCRIPTION)
         assert_equal(latest_log.params['description_original'], old_desc)
         assert_equal(latest_log.params['description_new'], 'new description')
@@ -3325,14 +3354,14 @@ class TestProject(OsfTestCase):
         self.project.add_contributor(contrib, auth=Auth(self.project.creator))
         self.project.save()
 
-        assert_equal(self.project.date_modified, self.project.logs[-1].date)
+        assert_equal(self.project.date_modified, self.project.logs.latest().date)
         assert_not_equal(self.project.date_modified, self.project.date_created)
 
     def test_date_modified_create_registration(self):
         RegistrationFactory(project=self.project)
         self.project.save()
 
-        assert_equal(self.project.date_modified, self.project.logs[-1].date)
+        assert_equal(self.project.date_modified, self.project.logs.latest().date)
         assert_not_equal(self.project.date_modified, self.project.date_created)
 
     def test_date_modified_create_component(self):
@@ -3795,8 +3824,8 @@ class TestForkNode(OsfTestCase):
         assert_equal(original.category, fork.category)
         assert_equal(original.description, fork.description)
         assert_true(len(fork.logs) == len(original.logs) + 1)
-        assert_not_equal(original.logs[-1].action, NodeLog.NODE_FORKED)
-        assert_equal(fork.logs[-1].action, NodeLog.NODE_FORKED)
+        assert_not_equal(original.logs.latest().action, NodeLog.NODE_FORKED)
+        assert_equal(fork.logs.latest().action, NodeLog.NODE_FORKED)
         assert_equal(original.tags, fork.tags)
         assert_equal(original.parent_node is None, fork.parent_node is None)
 
@@ -3853,7 +3882,7 @@ class TestForkNode(OsfTestCase):
         self.subproject.add_addon('github', self.auth)
 
         # Log time
-        fork_date = datetime.datetime.utcnow()
+        fork_date = timezone.now()
 
         # Fork node
         with mock.patch.object(Node, 'bulk_update_search'):
@@ -3972,7 +4001,7 @@ class TestForkNode(OsfTestCase):
         # Compare fork to original
         self._cmp_fork_original(
             self.user,
-            datetime.datetime.utcnow(),
+            timezone.now(),
             fork,
             self.registration,
         )
@@ -4171,7 +4200,7 @@ class TestRegisterNode(OsfTestCase):
     def test_registered_date(self):
         assert_almost_equal(
             self.registration.registered_date,
-            datetime.datetime.utcnow(),
+            timezone.now(),
             delta=datetime.timedelta(seconds=30),
         )
 
@@ -4550,6 +4579,15 @@ class TestUnregisteredUser(OsfTestCase):
         assert_true(self.user.verify_claim_token(valid, project_id=self.project._primary_key))
         assert_false(self.user.verify_claim_token('invalidtoken', project_id=self.project._primary_key))
 
+    def test_verify_claim_token_with_no_expiration_date(self):
+        # Legacy records may not have an 'expires' key
+        self.add_unclaimed_record()
+        record = self.user.get_unclaimed_record(self.project._primary_key)
+        del record['expires']
+        self.user.save()
+        token = record['token']
+        assert_true(self.user.verify_claim_token(token, project_id=self.project._primary_key))
+
     def test_claim_contributor(self):
         self.add_unclaimed_record()
         # sanity cheque
@@ -4568,7 +4606,7 @@ class TestTags(OsfTestCase):
         self.project.add_tag('scientific', auth=self.auth)
         assert_in('scientific', self.project.tags)
         assert_equal(
-            self.project.logs[-1].action,
+            self.project.logs.latest().action,
             NodeLog.TAG_ADDED
         )
 
@@ -4581,7 +4619,7 @@ class TestTags(OsfTestCase):
         self.project.remove_tag('scientific', auth=self.auth)
         assert_not_in('scientific', self.project.tags)
         assert_equal(
-            self.project.logs[-1].action,
+            self.project.logs.latest().action,
             NodeLog.TAG_REMOVED
         )
 
@@ -4617,7 +4655,7 @@ class TestContributorVisibility(OsfTestCase):
             self.project.visible_contributors
         )
         assert_equal(
-            self.project.logs[-1].action,
+            self.project.logs.latest().action,
             NodeLog.MADE_CONTRIBUTOR_INVISIBLE
         )
 
@@ -4634,7 +4672,7 @@ class TestContributorVisibility(OsfTestCase):
             self.project.visible_contributors
         )
         assert_equal(
-            self.project.logs[-1].action,
+            self.project.logs.latest().action,
             NodeLog.MADE_CONTRIBUTOR_VISIBLE
         )
         # Regression test: Ensure that hiding and showing the first contributor
@@ -4744,6 +4782,110 @@ class TestNodeAddContributorRegisteredOrNot(OsfTestCase):
         contributor = self.node.add_contributor_registered_or_not(auth=Auth(self.user), full_name='F Mercury', email=self.registered_user.username)
         assert_in(contributor._id, self.node.contributors)
         assert_equals(contributor.is_registered, True)
+
+
+class TestNodeSpam(OsfTestCase):
+
+    def setUp(self):
+        super(TestNodeSpam, self).setUp()
+        self.node = ProjectFactory(is_public=True)
+
+    def test_flag_spam_make_node_private(self):
+        assert_true(self.node.is_public)
+        with mock.patch.object(settings, 'SPAM_FLAGGED_MAKE_NODE_PRIVATE', True):
+            self.node.flag_spam()
+        assert_true(self.node.is_spammy)
+        assert_false(self.node.is_public)
+
+    def test_flag_spam_do_not_make_node_private(self):
+        assert_true(self.node.is_public)
+        with mock.patch.object(settings, 'SPAM_FLAGGED_MAKE_NODE_PRIVATE', False):
+            self.node.flag_spam()
+        assert_true(self.node.is_spammy)
+        assert_true(self.node.is_public)
+
+    def test_confirm_spam_makes_node_private(self):
+        assert_true(self.node.is_public)
+        self.node.confirm_spam()
+        assert_true(self.node.is_spammy)
+        assert_false(self.node.is_public)
+
+
+class TestOnNodeUpdate(OsfTestCase):
+
+    def setUp(self):
+        super(TestOnNodeUpdate, self).setUp()
+        self.user = UserFactory()
+        self.session = SessionFactory(user=self.user)
+        set_session(self.session)
+        self.node = ProjectFactory(is_public=True)
+
+    def tearDown(self):
+        handlers.celery_before_request()
+        super(TestOnNodeUpdate, self).tearDown()
+
+    @mock.patch('website.project.model.enqueue_task')
+    def test_enqueue_called(self, enqueue_task):
+        self.node.title = 'A new title'
+        self.node.save()
+
+        (task, ) = enqueue_task.call_args[0]
+
+        assert_equals(task.task, 'website.project.tasks.on_node_updated')
+        assert_equals(task.args[0], self.node._id)
+        assert_equals(task.args[1], self.user._id)
+        assert_equals(task.args[2], False)
+        assert_equals(task.args[3], {'title'})
+
+    @mock.patch('website.project.tasks.settings.SHARE_URL', None)
+    @mock.patch('website.project.tasks.settings.SHARE_API_TOKEN', None)
+    @mock.patch('website.project.tasks.requests')
+    def test_skips_no_settings(self, requests):
+        on_node_updated(self.node._id, self.user._id, False, {'is_public'})
+        assert_false(requests.post.called)
+
+    @mock.patch('website.project.tasks.settings.SHARE_URL', 'https://share.osf.io')
+    @mock.patch('website.project.tasks.settings.SHARE_API_TOKEN', 'Token')
+    @mock.patch('website.project.tasks.requests')
+    def test_updates_share(self, requests):
+        on_node_updated(self.node._id, self.user._id, False, {'is_public'})
+
+        kwargs = requests.post.call_args[1]
+        graph = kwargs['json']['data']['attributes']['data']['@graph']
+
+        assert_true(requests.post.called)
+        assert_equals(kwargs['headers']['Authorization'], 'Bearer Token')
+        assert_equals(graph[0]['uri'], '{}{}/'.format(settings.DOMAIN, self.node._id))
+
+    @mock.patch('website.project.tasks.settings.SHARE_URL', 'https://share.osf.io')
+    @mock.patch('website.project.tasks.settings.SHARE_API_TOKEN', 'Token')
+    @mock.patch('website.project.tasks.requests')
+    def test_update_share_correctly(self, requests):
+        cases = [{
+            'is_deleted': False,
+            'attrs': {'is_public': True, 'is_deleted': False, 'spam_status': SpamStatus.HAM}
+        }, {
+            'is_deleted': True,
+            'attrs': {'is_public': False, 'is_deleted': False, 'spam_status': SpamStatus.HAM}
+        }, {
+            'is_deleted': True,
+            'attrs': {'is_public': True, 'is_deleted': True, 'spam_status': SpamStatus.HAM}
+        }, {
+            'is_deleted': True,
+            'attrs': {'is_public': True, 'is_deleted': False, 'spam_status': SpamStatus.SPAM}
+        }]
+
+        for case in cases:
+            for attr, value in case['attrs'].items():
+                setattr(self.node, attr, value)
+            self.node.save()
+
+            on_node_updated(self.node._id, self.user._id, False, {'is_public'})
+
+            kwargs = requests.post.call_args[1]
+            graph = kwargs['json']['data']['attributes']['data']['@graph']
+            assert_equals(graph[1]['is_deleted'], case['is_deleted'])
+
 
 
 if __name__ == '__main__':

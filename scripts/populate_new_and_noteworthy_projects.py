@@ -5,28 +5,20 @@ import sys
 import logging
 import datetime
 import dateutil
+from django.utils import timezone
+from django.db import transaction
 from modularodm import Q
 from website.app import init_app
 from website import models
 from framework.auth.core import Auth
 from scripts import utils as script_utils
-from framework.mongo import database as db
 from framework.celery_tasks import app as celery_app
-from framework.transactions.context import TokuTransaction
-from website.discovery.views import activity
-from website.settings import POPULAR_LINKS_NODE, NEW_AND_NOTEWORTHY_LINKS_NODE, NEW_AND_NOTEWORTHY_CONTRIBUTOR_BLACKLIST
+from website.settings import \
+    POPULAR_LINKS_NODE, NEW_AND_NOTEWORTHY_LINKS_NODE,\
+    NEW_AND_NOTEWORTHY_CONTRIBUTOR_BLACKLIST, POPULAR_LINKS_REGISTRATIONS
 
 logger = logging.getLogger(__name__)
 
-def popular_activity_json():
-    """ Return popular_public_projects node_ids """
-
-    activity_json = activity()
-    popular = activity_json['popular_public_projects']
-    popular_ids = {'popular_node_ids': []}
-    for project in popular:
-        popular_ids['popular_node_ids'].append(project._id)
-    return popular_ids
 
 def unique_contributors(nodes, node):
     """ Projects in New and Noteworthy should not have common contributors """
@@ -57,15 +49,19 @@ def get_new_and_noteworthy_nodes():
     Mainly: public top-level projects with the greatest number of unique log actions
 
     """
-    today = datetime.datetime.now()
+    from osf.models import Node, NodeLog
+    today = timezone.now()
     last_month = (today - dateutil.relativedelta.relativedelta(months=1))
-    data = db.node.find({'date_created': {'$gt': last_month}, 'is_public': True, 'is_registration': False, 'parent_node': None,
-                         'is_deleted': False, 'is_collection': False})
+    data = Node.objects.filter(date_created__gte=last_month, is_public=True, is_deleted=False, parent_nodes__isnull=True)
     nodes = []
     for node in data:
-        unique_actions = len(db.nodelog.find({'node': node['_id']}).distinct('action'))
-        node['unique_actions'] = unique_actions
-        nodes.append(node)
+        unique_actions = NodeLog.objects.filter(node=node.pk).order_by('action').distinct('action').count()
+        n = {}
+        n['unique_actions'] = unique_actions
+        n['contributors'] = [c._id for c in node.contributors]
+        n['_id'] = node._id
+        n['title'] = node.title
+        nodes.append(n)
 
     noteworthy_nodes = sorted(nodes, key=lambda node: node.get('unique_actions'), reverse=True)[:25]
     filtered_new_and_noteworthy = filter_nodes(noteworthy_nodes)
@@ -105,20 +101,10 @@ def update_node_links(designated_node, target_node_ids, description):
 def main(dry_run=True):
     init_app(routes=False)
 
-    popular_node_ids = popular_activity_json()['popular_node_ids']
-    popular_links_node = models.Node.find_one(Q('_id', 'eq', POPULAR_LINKS_NODE))
     new_and_noteworthy_links_node = models.Node.find_one(Q('_id', 'eq', NEW_AND_NOTEWORTHY_LINKS_NODE))
     new_and_noteworthy_node_ids = get_new_and_noteworthy_nodes()
 
-    update_node_links(popular_links_node, popular_node_ids, 'popular')
     update_node_links(new_and_noteworthy_links_node, new_and_noteworthy_node_ids, 'new and noteworthy')
-
-    try:
-        popular_links_node.save()
-        logger.info('Node links on {} updated.'.format(popular_links_node._id))
-    except (KeyError, RuntimeError) as error:
-        logger.error('Could not migrate popular nodes due to error')
-        logger.exception(error)
 
     try:
         new_and_noteworthy_links_node.save()
@@ -135,7 +121,7 @@ def main(dry_run=True):
 def run_main(dry_run=True):
     if not dry_run:
         script_utils.add_file_logger(logger, __file__)
-    with TokuTransaction():
+    with transaction.atomic():
         main(dry_run=dry_run)
 
 if __name__ == "__main__":

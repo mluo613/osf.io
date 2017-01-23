@@ -2,19 +2,29 @@ from rest_framework import generics, permissions as drf_permissions
 from rest_framework.exceptions import ValidationError, NotFound
 from framework.auth.oauth_scopes import CoreScopes
 
-from website.project.model import Q, Node
+from website.project.model import Q, Node, Pointer
 from api.base import permissions as base_permissions
 from api.base.views import JSONAPIBaseView, BaseContributorDetail, BaseContributorList, BaseNodeLinksDetail, BaseNodeLinksList
 
 from api.base.serializers import HideIfWithdrawal
-from api.nodes.permissions import ReadOnlyIfRegistration, ContributorDetailPermissions, ContributorOrPublicForRelationshipPointers
 from api.base.serializers import LinkedNodesRelationshipSerializer
 from api.base.parsers import JSONAPIRelationshipParser
 from api.base.parsers import JSONAPIRelationshipParserForRegularJSON
 from api.base.utils import get_user_auth
 from api.comments.serializers import RegistrationCommentSerializer, CommentCreateSerializer
+from api.identifiers.serializers import RegistrationIdentifierSerializer
+from api.identifiers.views import IdentifierList
 from api.users.views import UserMixin
 
+from api.nodes.permissions import (
+    ReadOnlyIfRegistration,
+    ContributorDetailPermissions,
+    ContributorOrPublic,
+    ContributorOrPublicForRelationshipPointers,
+    AdminOrPublic,
+    ExcludeWithdrawals,
+    NodeLinksShowIfVersion,
+)
 from api.registrations.serializers import (
     RegistrationSerializer,
     RegistrationDetailSerializer,
@@ -27,18 +37,14 @@ from api.nodes.views import (
     NodeCommentsList, NodeProvidersList, NodeFilesList, NodeFileDetail,
     NodeAlternativeCitationsList, NodeAlternativeCitationDetail, NodeLogList,
     NodeInstitutionsList, WaterButlerMixin, NodeForksList, NodeWikiList, LinkedNodesList,
-    NodeViewOnlyLinksList, NodeViewOnlyLinkDetail
+    NodeViewOnlyLinksList, NodeViewOnlyLinkDetail, NodeCitationDetail, NodeCitationStyleDetail
 )
 
-from website.models import Pointer
 from api.registrations.serializers import RegistrationNodeLinksSerializer, RegistrationFileSerializer
+from api.wikis.serializers import RegistrationWikiSerializer
 
-from api.nodes.permissions import (
-    AdminOrPublic,
-    ExcludeWithdrawals,
-    ContributorOrPublic
-)
 from api.base.utils import get_object_or_error
+
 
 class RegistrationMixin(NodeMixin):
     """Mixin with convenience methods for retrieving the current registration based on the
@@ -144,12 +150,12 @@ class RegistrationList(JSONAPIBaseView, generics.ListAPIView, ODMFilterMixin):
     def get_default_odm_query(self):
         base_query = (
             Q('is_deleted', 'ne', True) &
-            Q('is_registration', 'eq', True)
+            Q('type', 'eq', 'osf.registration')
         )
         user = self.request.user
         permission_query = Q('is_public', 'eq', True)
         if not user.is_anonymous():
-            permission_query = (permission_query | Q('contributors', 'eq', user._id))
+            permission_query = (permission_query | Q('contributors', 'eq', user))
 
         query = base_query & permission_query
         return query
@@ -175,6 +181,17 @@ class RegistrationList(JSONAPIBaseView, generics.ListAPIView, ODMFilterMixin):
             non_withdrawn_nodes = Node.find(Q('_id', 'in', non_withdrawn_list))
             return non_withdrawn_nodes
         return nodes
+
+    # overrides FilterMixin
+    def postprocess_query_param(self, key, field_name, operation):
+        # tag queries will usually be on Tag.name,
+        # ?filter[tags]=foo should be translated to Q('tags__name', 'eq', 'foo')
+        # But queries on lists should be tags, e.g.
+        # ?filter[tags]=foo,bar should be translated to Q('tags', 'isnull', True)
+        # ?filter[tags]=[] should be translated to Q('tags', 'isnull', True)
+        if field_name == 'tags':
+            if operation['value'] not in (list(), tuple()):
+                operation['source_field_name'] = 'tags__name'
 
 
 class RegistrationDetail(JSONAPIBaseView, generics.RetrieveUpdateAPIView, RegistrationMixin, WaterButlerMixin):
@@ -518,12 +535,12 @@ class RegistrationChildrenList(JSONAPIBaseView, generics.ListAPIView, ODMFilterM
     def get_default_odm_query(self):
         base_query = (
             Q('is_deleted', 'ne', True) &
-            Q('is_registration', 'eq', True)
+            Q('type', 'eq', 'osf.registration')
         )
         user = self.request.user
         permission_query = Q('is_public', 'eq', True)
         if not user.is_anonymous():
-            permission_query = (permission_query | Q('contributors', 'eq', user._id))
+            permission_query = (permission_query | Q('contributors', 'eq', user))
 
         query = base_query & permission_query
         return query
@@ -532,13 +549,60 @@ class RegistrationChildrenList(JSONAPIBaseView, generics.ListAPIView, ODMFilterM
         node = self.get_node()
         req_query = self.get_query_from_request()
 
+        node_pks = node.node_relations.filter(is_node_link=False).select_related('child').values_list('child__pk', flat=True)
+
         query = (
-            Q('_id', 'in', [e._id for e in node.nodes if e.primary]) &
+            Q('pk', 'in', node_pks) &
             req_query
         )
-        nodes = Node.find(query)
+        nodes = Node.find(query).order_by('-date_modified')
         auth = get_user_auth(self.request)
-        return sorted([each for each in nodes if each.can_view(auth)], key=lambda n: n.date_modified, reverse=True)
+        pks = [each.pk for each in nodes if each.can_view(auth)]
+        return Node.objects.filter(pk__in=pks).order_by('-date_modified')
+
+
+class RegistrationCitationDetail(NodeCitationDetail, RegistrationMixin):
+    """ The registration citation for a registration in CSL format *read only*
+
+    ##Note
+    **This API endpoint is under active development, and is subject to change in the future**
+
+    ##RegistraitonCitationDetail Attributes
+
+        name                     type                description
+        =================================================================================
+        id                       string               unique ID for the citation
+        title                    string               title of project or component
+        author                   list                 list of authors for the work
+        publisher                string               publisher - most always 'Open Science Framework'
+        type                     string               type of citation - web
+        doi                      string               doi of the resource
+
+    """
+    required_read_scopes = [CoreScopes.NODE_REGISTRATIONS_READ]
+
+    view_category = 'registrations'
+    view_name = 'registration-citation'
+
+
+class RegistrationCitationStyleDetail(NodeCitationStyleDetail, RegistrationMixin):
+    """ The registration citation for a registration in a specific style's format t *read only*
+
+        ##Note
+        **This API endpoint is under active development, and is subject to change in the future**
+
+    ##RegistrationCitationStyleDetail Attributes
+
+        name                     type                description
+        =================================================================================
+        citation                string               complete citation for a registration in the given style
+
+    """
+    required_read_scopes = [CoreScopes.NODE_REGISTRATIONS_READ]
+
+    view_category = 'registrations'
+    view_name = 'registration-style-citation'
+
 
 class RegistrationForksList(NodeForksList, RegistrationMixin):
     """Forks of the current registration. *Writeable*.
@@ -702,7 +766,8 @@ class RegistrationNodeLinksList(BaseNodeLinksList, RegistrationMixin):
         ContributorOrPublic,
         ReadOnlyIfRegistration,
         base_permissions.TokenHasScope,
-        ExcludeWithdrawals
+        ExcludeWithdrawals,
+        NodeLinksShowIfVersion,
     )
 
     required_read_scopes = [CoreScopes.NODE_REGISTRATIONS_READ]
@@ -757,7 +822,8 @@ class RegistrationNodeLinksDetail(BaseNodeLinksDetail, RegistrationMixin):
     permission_classes = (
         drf_permissions.IsAuthenticatedOrReadOnly,
         base_permissions.TokenHasScope,
-        ExcludeWithdrawals
+        ExcludeWithdrawals,
+        NodeLinksShowIfVersion,
     )
     required_read_scopes = [CoreScopes.NODE_REGISTRATIONS_READ]
     required_write_scopes = [CoreScopes.NULL]
@@ -815,6 +881,8 @@ class RegistrationWikiList(NodeWikiList, RegistrationMixin):
     view_category = 'registrations'
     view_name = 'registration-wikis'
 
+    serializer_class = RegistrationWikiSerializer
+
 
 class RegistrationLinkedNodesList(LinkedNodesList, RegistrationMixin):
     """List of linked nodes for a registration."""
@@ -851,13 +919,37 @@ class RegistrationLinkedNodesRelationship(JSONAPIBaseView, generics.RetrieveAPIV
         node = self.get_node(check_object_permissions=False)
         auth = get_user_auth(self.request)
         obj = {'data': [
-            pointer for pointer in
-            node.nodes_pointer
-            if not pointer.node.is_deleted and not pointer.node.is_collection and
-            pointer.node.can_view(auth)
+            linked_node for linked_node in
+            node.linked_nodes.filter(is_deleted=False).exclude(type='osf.collection')
+            if linked_node.can_view(auth)
         ], 'self': node}
         self.check_object_permissions(self.request, obj)
         return obj
+
+
+class LinkedRegistrationsList(JSONAPIBaseView, generics.ListAPIView, RegistrationMixin):
+    """List of registrations linked to this node. *Read-only*.
+
+    Linked registrations are the registrations pointed to by node links.
+
+    """
+    serializer_class = RegistrationSerializer
+    view_category = 'registrations'
+    view_name = 'linked-registrations'
+
+    def get_queryset(self):
+        return [node for node in
+            super(LinkedNodesList, self).get_queryset()
+            if node.is_registration]
+
+    # overrides APIView
+    def get_parser_context(self, http_request):
+        """
+        Tells parser that we are creating a relationship
+        """
+        res = super(LinkedNodesList, self).get_parser_context(http_request)
+        res['is_relationship'] = True
+        return res
 
 
 class RegistrationViewOnlyLinksList(NodeViewOnlyLinksList, RegistrationMixin):
@@ -876,3 +968,40 @@ class RegistrationViewOnlyLinkDetail(NodeViewOnlyLinkDetail, RegistrationMixin):
 
     view_category = 'registrations'
     view_name = 'registration-view-only-link-detail'
+
+
+class RegistrationIdentifierList(RegistrationMixin, IdentifierList):
+    """List of identifiers for a specified node. *Read-only*.
+
+    ##Identifier Attributes
+
+    OSF Identifier entities have the "identifiers" `type`.
+
+        name           type                   description
+        ----------------------------------------------------------------------------
+        category       string                 e.g. 'ark', 'doi'
+        value          string                 the identifier value itself
+
+    ##Links
+
+        self: this identifier's detail page
+
+    ##Relationships
+
+    ###Referent
+
+    The identifier is refers to this node.
+
+    ##Actions
+
+    *None*.
+
+    ##Query Params
+
+     Identifiers may be filtered by their category.
+
+    #This Request/Response
+
+    """
+
+    serializer_class = RegistrationIdentifierSerializer

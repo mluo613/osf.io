@@ -1,22 +1,20 @@
 from __future__ import unicode_literals
 
+import itsdangerous
+import mock
 import pytz
-from nose.tools import *  # flake8: noqa
-
 from api.base.settings.defaults import API_BASE
 from api_tests import utils as api_utils
 from framework.auth.core import Auth
-
+from framework.sessions.model import Session
+from nose.tools import *  # flake8: noqa
+from osf_tests.factories import (AuthUserFactory, CommentFactory,
+                                 ProjectFactory, UserFactory)
 from tests.base import ApiTestCase, capture_signals
-from tests.factories import (
-    ProjectFactory,
-    UserFactory,
-    AuthUserFactory,
-    CommentFactory
-)
-from website.addons.osfstorage import settings as osfstorage_settings
-from website.project.signals import contributor_removed
+from website import settings as website_settings
+from addons.osfstorage import settings as osfstorage_settings
 from website.project.model import NodeLog
+from website.project.signals import contributor_removed
 
 
 # stolen from^W^Winspired by DRF rest_framework.fields.DateTimeField.to_representation
@@ -57,10 +55,36 @@ class TestFileView(ApiTestCase):
         assert_is_not_none(guid)
         assert_equal(res.json['data']['attributes']['guid'], guid._id)
 
+    @mock.patch('api.base.throttling.CreateGuidThrottle.allow_request')
+    def test_file_guid_not_created_with_basic_auth(self, mock_allow):
+        res = self.app.get(self.file_url + '?create_guid=1', auth=self.user.auth)
+        guid = res.json['data']['attributes'].get('guid', None)
+        assert_equal(res.status_code, 200)
+        assert_equal(mock_allow.call_count, 1)
+        assert guid is None
+
+    @mock.patch('api.base.throttling.CreateGuidThrottle.allow_request')
+    def test_file_guid_created_with_cookie(self, mock_allow):
+        session = Session(data={'auth_user_id': self.user._id})
+        session.save()
+        cookie = itsdangerous.Signer(website_settings.SECRET_KEY).sign(session._id)
+        self.app.set_cookie(website_settings.COOKIE_NAME, str(cookie))
+
+        res = self.app.get(self.file_url + '?create_guid=1', auth=self.user.auth)
+
+        self.app.reset()  # clear cookie
+
+        assert_equal(res.status_code, 200)
+
+        guid = res.json['data']['attributes'].get('guid', None)
+        assert_is_not_none(guid)
+
+        assert_equal(guid, self.file.get_guid()._id)
+        assert_equal(mock_allow.call_count, 1)
+
     def test_get_file(self):
         res = self.app.get(self.file_url, auth=self.user.auth)
-        self.file.versions[-1]._clear_caches()
-        self.file.versions[-1].reload()
+        self.file.versions.last().reload()
         assert_equal(res.status_code, 200)
         assert_equal(res.json.keys(), ['data'])
         attributes = res.json['data']['attributes']
@@ -70,9 +94,10 @@ class TestFileView(ApiTestCase):
         assert_equal(attributes['materialized_path'], self.file.materialized_path)
         assert_equal(attributes['last_touched'], None)
         assert_equal(attributes['provider'], self.file.provider)
-        assert_equal(attributes['size'], self.file.versions[-1].size)
-        assert_equal(attributes['date_modified'], _dt_to_iso8601(self.file.versions[-1].date_created.replace(tzinfo=pytz.utc)))
-        assert_equal(attributes['date_created'], _dt_to_iso8601(self.file.versions[0].date_created.replace(tzinfo=pytz.utc)))
+        assert_equal(attributes['size'], self.file.versions.last().size)
+        assert_equal(attributes['current_version'], len(self.file.history))
+        assert_equal(attributes['date_modified'], _dt_to_iso8601(self.file.versions.last().date_created.replace(tzinfo=pytz.utc)))
+        assert_equal(attributes['date_created'], _dt_to_iso8601(self.file.versions.first().date_created.replace(tzinfo=pytz.utc)))
         assert_equal(attributes['extra']['hashes']['md5'], None)
         assert_equal(attributes['extra']['hashes']['sha256'], None)
         assert_equal(attributes['tags'], [])
@@ -86,13 +111,13 @@ class TestFileView(ApiTestCase):
         assert_in(expected_url, actual_url)
 
     def test_file_has_comments_link(self):
-        guid = self.file.get_guid(create=True)
+        self.file.get_guid(create=True)
         res = self.app.get(self.file_url, auth=self.user.auth)
         assert_equal(res.status_code, 200)
         assert_in('comments', res.json['data']['relationships'].keys())
-        expected_url = '/{}nodes/{}/comments/?filter[target]={}'.format(API_BASE, self.node._id, guid._id)
         url = res.json['data']['relationships']['comments']['links']['related']['href']
-        assert_in(expected_url, url)
+        assert_equal(self.app.get(url, auth=self.user.auth).status_code, 200)
+        assert_equal(res.json['data']['type'], 'files')
 
     def test_file_has_correct_unread_comments_count(self):
         contributor = AuthUserFactory()
@@ -153,9 +178,9 @@ class TestFileView(ApiTestCase):
             self.file_url,
             auth=self.user.auth
         )
-        assert_equal(len(self.node.logs),2)
-        assert_equal(self.node.logs[-1].action, NodeLog.CHECKED_OUT)
-        assert_equal(self.node.logs[-1].user, self.user)
+        assert_equal(self.node.logs.count(),2)
+        assert_equal(self.node.logs.latest().action, NodeLog.CHECKED_OUT)
+        assert_equal(self.node.logs.latest().user, self.user)
         assert_equal(
             self.user._id,
             res.json['data']['relationships']['checkout']['links']['related']['meta']['id']
@@ -256,8 +281,8 @@ class TestFileView(ApiTestCase):
         self.node.reload()
         assert_equal(res.status_code, 200)
         assert_equal(self.file.checkout, None)
-        assert_equal(self.node.logs[-1].action, NodeLog.CHECKED_IN)
-        assert_equal(self.node.logs[-1].user, self.user)
+        assert_equal(self.node.logs.latest().action, NodeLog.CHECKED_IN)
+        assert_equal(self.node.logs.latest().user, self.user)
 
     def test_admin_can_checkout(self):
         res = self.app.put_json_api(
@@ -270,11 +295,11 @@ class TestFileView(ApiTestCase):
         self.node.reload()
         assert_equal(res.status_code, 200)
         assert_equal(self.file.checkout, self.user)
-        assert_equal(self.node.logs[-1].action, NodeLog.CHECKED_OUT)
-        assert_equal(self.node.logs[-1].user, self.user)
+        assert_equal(self.node.logs.latest().action, NodeLog.CHECKED_OUT)
+        assert_equal(self.node.logs.latest().user, self.user)
 
     def test_cannot_checkin_when_already_checked_in(self):
-        count = len(self.node.logs)
+        count = self.node.logs.count()
         assert_false(self.file.is_checked_out)
         res = self.app.put_json_api(
             self.file_url,
@@ -285,7 +310,7 @@ class TestFileView(ApiTestCase):
         self.file.reload()
         self.node.reload()
         assert_equal(res.status_code, 200)
-        assert_equal(len(self.node.logs), count)
+        assert_equal(self.node.logs.count(), count)
         assert_equal(self.file.checkout, None)
 
     def test_cannot_checkout_when_checked_out(self):
@@ -293,7 +318,7 @@ class TestFileView(ApiTestCase):
         self.node.add_contributor(user)
         self.file.checkout = user
         self.file.save()
-        count = len(self.node.logs)
+        count = self.node.logs.count()
         res = self.app.put_json_api(
             self.file_url,
             {'data': {'id': self.file._id, 'type': 'files', 'attributes': {'checkout': self.user._id}}},
@@ -304,12 +329,12 @@ class TestFileView(ApiTestCase):
         self.node.reload()
         assert_equal(res.status_code, 200)
         assert_equal(self.file.checkout, user)
-        assert_equal(len(self.node.logs), count)
+        assert_equal(self.node.logs.count(), count)
 
     def test_noncontrib_cannot_checkout(self):
         user = AuthUserFactory()
         assert_equal(self.file.checkout, None)
-        assert user._id not in self.node.permissions.keys()
+        assert_false(self.node.has_permission(user, 'read'))
         res = self.app.put_json_api(
             self.file_url,
             {'data': {'id': self.file._id, 'type': 'files', 'attributes': {'checkout': self.user._id}}},
@@ -320,7 +345,7 @@ class TestFileView(ApiTestCase):
         self.node.reload()
         assert_equal(res.status_code, 403)
         assert_equal(self.file.checkout, None)
-        assert self.node.logs[-1].action != NodeLog.CHECKED_OUT
+        assert self.node.logs.latest().action != NodeLog.CHECKED_OUT
 
     def test_read_contrib_cannot_checkout(self):
         user = AuthUserFactory()
@@ -336,7 +361,7 @@ class TestFileView(ApiTestCase):
         self.file.reload()
         assert_equal(res.status_code, 403)
         assert_equal(self.file.checkout, None)
-        assert self.node.logs[-1].action != NodeLog.CHECKED_OUT
+        assert self.node.logs.latest().action != NodeLog.CHECKED_OUT
 
     def test_user_can_checkin(self):
         user = AuthUserFactory()
@@ -396,6 +421,20 @@ class TestFileView(ApiTestCase):
         url = '/{}files/{}/'.format(API_BASE, self.node._id)
         res = self.app.get(url, auth=self.user.auth, expect_errors=True)
         assert_equal(res.status_code, 404)
+
+    def test_current_version_is_equal_to_length_of_history(self):
+        res = self.app.get(self.file_url, auth=self.user.auth)
+        assert_equal(res.json['data']['attributes']['current_version'], 1)
+        for version in range(2, 4):
+            self.file.create_version(self.user, {
+                'object': '06d80e' + str(version),
+                'service': 'cloud',
+                osfstorage_settings.WATERBUTLER_RESOURCE: 'osf',
+            }, {'size': 1337,
+                'contentType': 'img/png'
+            }).save()
+            res = self.app.get(self.file_url, auth=self.user.auth)
+            assert_equal(res.json['data']['attributes']['current_version'], version)
 
 
 class TestFileVersionView(ApiTestCase):
@@ -517,16 +556,15 @@ class TestFileTagging(ApiTestCase):
         assert_equal(res.json['data']['attributes']['tags'][0], 'goofy')
 
     def test_add_tag_adds_log(self):
-        count = len(self.node.logs)
+        count = self.node.logs.count()
         self.app.put_json_api(self.url, self.payload, auth=self.user.auth)
-        assert_equal(len(self.node.logs), count + 1)
-        assert_equal(NodeLog.FILE_TAG_ADDED, self.node.logs[-1].action)
+        assert_equal(self.node.logs.count(), count + 1)
+        assert_equal(NodeLog.FILE_TAG_ADDED, self.node.logs.latest().action)
 
     def test_remove_tag_adds_log(self):
         self.app.put_json_api(self.url, self.payload, auth=self.user.auth)
         self.payload['data']['attributes']['tags'] = []
-        count = len(self.node.logs)
+        count = self.node.logs.count()
         self.app.put_json_api(self.url, self.payload, auth=self.user.auth)
-        assert_equal(len(self.node.logs), count + 1)
-        assert_equal(NodeLog.FILE_TAG_REMOVED, self.node.logs[-1].action)
-
+        assert_equal(self.node.logs.count(), count + 1)
+        assert_equal(NodeLog.FILE_TAG_REMOVED, self.node.logs.latest().action)

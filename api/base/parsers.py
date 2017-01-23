@@ -42,10 +42,6 @@ class JSONAPIParser(JSONParser):
         if not target_type:
             raise JSONAPIException(source={'pointer': 'data/relationships/{}/data/type'.format(related_resource)}, detail=NO_TYPE_ERROR)
 
-        if target_type != related_resource:
-            raise JSONAPIException(source={'pointer': 'data/relationships/{}'.format(related_resource)},
-                                   detail='Request relationships key "{}" does not match target_type "{}"'.format(related_resource, target_type))
-
         id = data.get('id')
         return {'id': id, 'target_type': target_type}
 
@@ -193,3 +189,22 @@ class JSONAPIOnetoOneRelationshipParserForRegularJSON(JSONAPIOnetoOneRelationshi
     Allows same processing as JSONAPIRelationshipParser to occur for requests with application/json media type.
     """
     media_type = 'application/json'
+
+
+class JSONAPIMultipleRelationshipsParser(JSONAPIParser):
+    def flatten_relationships(self, relationships):
+        rel = {}
+        for resource in relationships:
+            ret = super(JSONAPIMultipleRelationshipsParser, self).flatten_relationships({resource: relationships[resource]})
+            if ret.get('target_type') and ret.get('id'):
+                rel[resource] = ret['id']
+        return rel
+
+
+class JSONAPIMultipleRelationshipsParserForRegularJSON(JSONAPIParserForRegularJSON):
+    def flatten_relationships(self, relationships):
+        ret = super(JSONAPIMultipleRelationshipsParserForRegularJSON, self).flatten_relationships(relationships)
+        related_resource = relationships.keys()[0]
+        if ret.get('target_type') and ret.get('id'):
+            return {related_resource: ret['id']}
+        return ret

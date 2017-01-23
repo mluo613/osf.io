@@ -135,7 +135,7 @@ def node_register_template_page(auth, node, metaschema_id, **kwargs):
                     'message_short': 'Invalid schema name',
                     'message_long': 'No registration schema with that name could be found.'
                 })
-        if meta_schema not in node.registered_schema:
+        if not node.registered_schema.filter(id=meta_schema.id).exists():
             raise HTTPError(http.BAD_REQUEST, data={
                 'message_short': 'Invalid schema',
                 'message_long': 'This registration has no registration supplment with that name.'
@@ -257,7 +257,7 @@ def _get_or_create_identifiers(node):
 def node_identifiers_get(node, **kwargs):
     """Retrieve identifiers for a node. Node must be a public registration.
     """
-    if not node.is_registration or not node.is_public:
+    if not node.is_public:
         raise HTTPError(http.BAD_REQUEST)
     return {
         'doi': node.get_identifier_value('doi'),
@@ -270,8 +270,7 @@ def node_identifiers_get(node, **kwargs):
 def node_identifiers_post(auth, node, **kwargs):
     """Create identifier pair for a node. Node must be a public registration.
     """
-    # TODO: Fail if `node` is retracted
-    if not node.is_registration or not node.is_public:  # or node.is_retracted:
+    if not node.is_public or node.is_retracted:
         raise HTTPError(http.BAD_REQUEST)
     if node.get_identifier('doi') or node.get_identifier('ark'):
         raise HTTPError(http.BAD_REQUEST)

@@ -3,22 +3,23 @@
 import httplib as http
 
 from flask import request
+from modularodm import Q
 from modularodm.exceptions import ValidationError, ValidationValueError
 
 from framework import forms, status
 from framework.auth import cas
 from framework.auth import User
-from framework.auth.core import get_user, generate_confirm_token, generate_verification_key
+from framework.auth.core import get_user, generate_verification_key
 from framework.auth.decorators import collect_auth, must_be_logged_in
 from framework.auth.forms import PasswordForm, SetEmailAndPasswordForm
 from framework.auth.signals import user_registered
-from framework.auth.utils import validate_email
+from framework.auth.utils import validate_email, validate_recaptcha
 from framework.exceptions import HTTPError
 from framework.flask import redirect  # VOL-aware redirect
 from framework.sessions import session
 from framework.transactions.handlers import no_auto_transaction
 from website import mails, language, settings
-from website.models import Node
+from website.models import Node, PreprintService
 from website.notifications.utils import check_if_all_global_subscriptions_are_none
 from website.profile import utils as profile_utils
 from website.project.decorators import (must_have_permission, must_be_valid_project, must_not_be_registration,
@@ -41,7 +42,7 @@ def get_node_contributors_abbrev(auth, node, **kwargs):
     if 'user_ids' in kwargs:
         users = [
             User.load(user_id) for user_id in kwargs['user_ids']
-            if user_id in node.visible_contributor_ids
+            if node.contributor_set.filter(user__guid__guid=user_id).exists()
         ]
     else:
         users = node.visible_contributors
@@ -178,7 +179,7 @@ def deserialize_contributors(node, user_dicts, auth, validate=False):
                     fullname=fullname,
                     email=email)
                 contributor.save()
-            except ValidationValueError:
+            except ValidationError:
                 ## FIXME: This suppresses an exception if ID not found & new validation fails; get_user will return None
                 contributor = get_user(email=email)
 
@@ -332,8 +333,8 @@ def project_remove_contributor(auth, **kwargs):
             if auth.user != contributor:
                 raise HTTPError(http.FORBIDDEN)
 
-        if len(node.visible_contributor_ids) == 1 \
-                and node.visible_contributor_ids[0] == contributor._id:
+        if node.visible_contributors.count() == 1 \
+                and node.visible_contributors[0] == contributor:
             raise HTTPError(http.FORBIDDEN, data={
                 'message_long': 'Must have at least one bibliographic contributor'
             })
@@ -359,37 +360,57 @@ def project_remove_contributor(auth, **kwargs):
     return redirect_url
 
 
-def send_claim_registered_email(claimer, unreg_user, node, throttle=24 * 3600):
-    unclaimed_record = unreg_user.get_unclaimed_record(node._primary_key)
-    # roll the valid token for each email, thus user cannot change email and approve a different email address
+def send_claim_registered_email(claimer, unclaimed_user, node, throttle=24 * 3600):
+    """
+    A registered user claiming the unclaimed user account as an contributor to a project.
+    Send an email for claiming the account to the referrer and notify the claimer.
+
+    :param claimer: the claimer
+    :param unclaimed_user: the user account to claim
+    :param node: the project node where the user account is claimed
+    :param throttle: the time period in seconds before another claim for the account can be made
+    :return:
+    :raise: http.BAD_REQUEST
+    """
+
+    unclaimed_record = unclaimed_user.get_unclaimed_record(node._primary_key)
+
+    # check throttle
     timestamp = unclaimed_record.get('last_sent')
     if not throttle_period_expired(timestamp, throttle):
-        raise HTTPError(400, data=dict(
+        raise HTTPError(http.BAD_REQUEST, data=dict(
             message_long='User account can only be claimed with an existing user once every 24 hours'
         ))
-    unclaimed_record['token'] = generate_confirm_token()
+
+    # roll the valid token for each email, thus user cannot change email and approve a different email address
+    verification_key = generate_verification_key(verification_type='claim')
+    unclaimed_record['token'] = verification_key['token']
+    unclaimed_record['expires'] = verification_key['expires']
     unclaimed_record['claimer_email'] = claimer.username
-    unreg_user.save()
+    unclaimed_user.save()
+
     referrer = User.load(unclaimed_record['referrer_id'])
     claim_url = web_url_for(
         'claim_user_registered',
-        uid=unreg_user._primary_key,
+        uid=unclaimed_user._primary_key,
         pid=node._primary_key,
         token=unclaimed_record['token'],
         _external=True,
     )
+
     # Send mail to referrer, telling them to forward verification link to claimer
     mails.send_mail(
         referrer.username,
         mails.FORWARD_INVITE_REGISTERED,
-        user=unreg_user,
+        user=unclaimed_user,
         referrer=referrer,
         node=node,
         claim_url=claim_url,
         fullname=unclaimed_record['name'],
     )
     unclaimed_record['last_sent'] = get_timestamp()
-    unreg_user.save()
+    unclaimed_user.save()
+
     # Send mail to claimer, telling them to wait for referrer
     mails.send_mail(
         claimer.username,
@@ -400,64 +421,94 @@ def send_claim_registered_email(claimer, unreg_user, node, throttle=24 * 3600):
     )
 
 
-def send_claim_email(email, user, node, notify=True, throttle=24 * 3600, email_template='default'):
-    """Send an email for claiming a user account. Either sends to the given email
-    or the referrer's email, depending on the email address provided.
+def send_claim_email(email, unclaimed_user, node, notify=True, throttle=24 * 3600, email_template='default'):
+    """
+    Unregistered user claiming a user account as an contributor to a project. Send an email for claiming the account.
+    Either sends to the given email or the referrer's email, depending on the email address provided.
 
     :param str email: The address given in the claim user form
-    :param User user: The User record to claim.
+    :param User unclaimed_user: The User record to claim.
     :param Node node: The node where the user claimed their account.
     :param bool notify: If True and an email is sent to the referrer, an email
         will also be sent to the invited user about their pending verification.
     :param int throttle: Time period (in seconds) after the referrer is
         emailed during which the referrer will not be emailed again.
+    :param str email_template: the email template to use
+    :return
+    :raise http.BAD_REQUEST
 
     """
-    claimer_email = email.lower().strip()
 
-    unclaimed_record = user.get_unclaimed_record(node._primary_key)
+    claimer_email = email.lower().strip()
+    unclaimed_record = unclaimed_user.get_unclaimed_record(node._primary_key)
     referrer = User.load(unclaimed_record['referrer_id'])
-    claim_url = user.get_claim_url(node._primary_key, external=True)
-    # If given email is the same provided by user, just send to that email
+    claim_url = unclaimed_user.get_claim_url(node._primary_key, external=True)
+
+    # Option 1:
+    #   When adding the contributor, the referrer provides both name and email.
+    #   The given email is the same provided by user, just send to that email.
+    preprint_provider = None
     if unclaimed_record.get('email') == claimer_email:
-        mail_tpl = getattr(mails, 'INVITE_{}'.format(email_template.upper()))
+        # check email template for branded preprints
+        if email_template == 'preprint':
+            email_template, preprint_provider = find_preprint_provider(node)
+            if not email_template or not preprint_provider:
+                return
+            mail_tpl = getattr(mails, 'INVITE_PREPRINT')(email_template, preprint_provider)
+        else:
+            mail_tpl = getattr(mails, 'INVITE_DEFAULT'.format(email_template.upper()))
+
         to_addr = claimer_email
         unclaimed_record['claimer_email'] = claimer_email
-        user.save()
-    else:  # Otherwise have the referrer forward the email to the user
-        # roll the valid token for each email, thus user cannot change email and approve a different email address
+        unclaimed_user.save()
+    # Option 2:
+    # TODO: [new improvement ticket] this option is disabled from preprint but still available on the project page
+    #   When adding the contributor, the referred only provides the name.
+    #   The account is later claimed by some one who provides the email.
+    #   Send email to the referrer and ask her/him to forward the email to the user.
+    else:
+        # check throttle
         timestamp = unclaimed_record.get('last_sent')
         if not throttle_period_expired(timestamp, throttle):
-            raise HTTPError(400, data=dict(
+            raise HTTPError(http.BAD_REQUEST, data=dict(
                 message_long='User account can only be claimed with an existing user once every 24 hours'
             ))
+        # roll the valid token for each email, thus user cannot change email and approve a different email address
+        verification_key = generate_verification_key(verification_type='claim')
         unclaimed_record['last_sent'] = get_timestamp()
-        unclaimed_record['token'] = generate_confirm_token()
+        unclaimed_record['token'] = verification_key['token']
+        unclaimed_record['expires'] = verification_key['expires']
         unclaimed_record['claimer_email'] = claimer_email
-        user.save()
-        claim_url = user.get_claim_url(node._primary_key, external=True)
+        unclaimed_user.save()
+
+        claim_url = unclaimed_user.get_claim_url(node._primary_key, external=True)
+        # send an email to the invited user without `claim_url`
         if notify:
             pending_mail = mails.PENDING_VERIFICATION
             mails.send_mail(
                 claimer_email,
                 pending_mail,
-                user=user,
+                user=unclaimed_user,
                 referrer=referrer,
                 fullname=unclaimed_record['name'],
                 node=node
             )
         mail_tpl = mails.FORWARD_INVITE
         to_addr = referrer.username
+
+    # Send an email to the claimer (Option 1) or to the referrer (Option 2) with `claim_url`
     mails.send_mail(
         to_addr,
         mail_tpl,
-        user=user,
+        user=unclaimed_user,
         referrer=referrer,
         node=node,
         claim_url=claim_url,
         email=claimer_email,
-        fullname=unclaimed_record['name']
+        fullname=unclaimed_record['name'],
+        branded_service_name=preprint_provider
     )
+
     return to_addr
 
 
@@ -471,7 +522,16 @@ def notify_added_contributor(node, contributor, auth=None, throttle=None, email_
     if (contributor.is_registered and not node.template_node and not node.is_fork and
             (not node.parent_node or
                 (node.parent_node and not node.parent_node.is_contributor(contributor)))):
-        email_template = getattr(mails, 'CONTRIBUTOR_ADDED_{}'.format(email_template.upper()))
+
+        preprint_provider = None
+        if email_template == 'preprint':
+            email_template, preprint_provider = find_preprint_provider(node)
+            if not email_template or not preprint_provider:
+                return
+            email_template = getattr(mails, 'CONTRIBUTOR_ADDED_PREPRINT')(email_template, preprint_provider)
+        else:
+            email_template = getattr(mails, 'CONTRIBUTOR_ADDED_DEFAULT'.format(email_template.upper()))
+
         contributor_record = contributor.contributor_added_email_records.get(node._id, {})
         if contributor_record:
             timestamp = contributor_record.get('last_sent', None)
@@ -487,7 +547,8 @@ def notify_added_contributor(node, contributor, auth=None, throttle=None, email_
             user=contributor,
             node=node,
             referrer_name=auth.user.fullname if auth else '',
-            all_global_subscriptions_none=check_if_all_global_subscriptions_are_none(contributor)
+            all_global_subscriptions_none=check_if_all_global_subscriptions_are_none(contributor),
+            branded_service_name=preprint_provider
         )
 
         contributor.contributor_added_email_records[node._id]['last_sent'] = get_timestamp()
@@ -495,6 +556,26 @@ def notify_added_contributor(node, contributor, auth=None, throttle=None, email_
 
     elif not contributor.is_registered:
         unreg_contributor_added.send(node, contributor=contributor, auth=auth, email_template=email_template)
+
+
+def find_preprint_provider(node):
+    """
+    Given a node, find the preprint and the service provider.
+
+    :param node: the node to which a contributer or preprint author is added
+    :return: the email template
+    """
+
+    try:
+        preprint = PreprintService.find_one(Q('node', 'eq', node._id))
+        provider = preprint.provider
+        if provider._id == 'osf':
+            return 'osf', provider.name
+        else:
+            return 'branded', provider.name
+    # TODO: fine-grained exception handling
+    except Exception:
+        return None, None
 
 
 def verify_claim_token(user, token, pid):
@@ -523,7 +604,7 @@ def claim_user_registered(auth, node, **kwargs):
 
     current_user = auth.user
 
-    sign_out_url = web_url_for('auth_login', logout=True, next=request.url)
+    sign_out_url = web_url_for('auth_register', logout=True, next=request.url)
     if not current_user:
         return redirect(sign_out_url)
 
@@ -631,10 +712,28 @@ def claim_user_form(auth, **kwargs):
     user.update_guessed_names()
     # The email can be the original referrer email if no claimer email has been specified.
     claimer_email = unclaimed_record.get('claimer_email') or unclaimed_record.get('email')
+    # If there is a registered user with this email, redirect to 're-enter password' page
+    try:
+        user_from_email = User.objects.get(emails__icontains=claimer_email) if claimer_email else None
+    except User.DoesNotExist:
+        user_from_email = None
+    if user_from_email and user_from_email.is_registered:
+        return redirect(web_url_for('claim_user_registered', uid=uid, pid=pid, token=token))
+
     form = SetEmailAndPasswordForm(request.form, token=token)
     if request.method == 'POST':
-        if form.validate():
+        if not form.validate():
+            forms.push_errors_to_status(form.errors)
+        elif settings.RECAPTCHA_SITE_KEY and not validate_recaptcha(request.form.get('g-recaptcha-response'), remote_ip=request.remote_addr):
+            status.push_status_message('Invalid captcha supplied.', kind='error')
+        else:
             username, password = claimer_email, form.password.data
+            if not username:
+                raise HTTPError(http.BAD_REQUEST, data=dict(
+                    message_long='No email associated with this account. Please claim this '
+                    'account on the project to which you were invited.'
+                ))
+
             user.register(username=username, password=password)
             # Clear unclaimed records
             user.unclaimed_records = {}
@@ -648,8 +747,6 @@ def claim_user_form(auth, **kwargs):
                 username=user.username,
                 verification_key=user.verification_key
             ))
-        else:
-            forms.push_errors_to_status(form.errors)
 
     return {
         'firstname': user.given_name,
@@ -703,29 +800,38 @@ def invite_contributor_post(node, **kwargs):
 
 @must_be_contributor_or_public
 def claim_user_post(node, **kwargs):
-    """View for claiming a user from the X-editable form on a project page.
     """
-    reqdata = request.json
-    # Unreg user
-    user = User.load(reqdata['pk'])
-    unclaimed_data = user.get_unclaimed_record(node._primary_key)
-    # Submitted through X-editable
-    if 'value' in reqdata:  # Submitted email address
-        email = reqdata['value'].lower().strip()
+    View for claiming a user from the X-editable form on a project page.
+
+    :param node: the project node
+    :return:
+    """
+
+    request_data = request.json
+
+    # The unclaimed user
+    unclaimed_user = User.load(request_data['pk'])
+    unclaimed_data = unclaimed_user.get_unclaimed_record(node._primary_key)
+
+    # Claimer is not logged in and submit her/his email through X-editable, stored in `request_data['value']`
+    if 'value' in request_data:
+        email = request_data['value'].lower().strip()
         claimer = get_user(email=email)
+        # registered user
         if claimer and claimer.is_registered:
-            send_claim_registered_email(claimer=claimer, unreg_user=user,
-                node=node)
+            send_claim_registered_email(claimer, unclaimed_user, node)
+        # unregistered user
         else:
-            send_claim_email(email, user, node, notify=True)
-    # TODO(sloria): Too many assumptions about the request data. Just use
-    elif 'claimerId' in reqdata:  # User is logged in and confirmed identity
-        claimer_id = reqdata['claimerId']
+            send_claim_email(email, unclaimed_user, node, notify=True)
+    # Claimer is logged in with confirmed identity stored in `request_data['claimerId']`
+    elif 'claimerId' in request_data:
+        claimer_id = request_data['claimerId']
         claimer = User.load(claimer_id)
-        send_claim_registered_email(claimer=claimer, unreg_user=user, node=node)
+        send_claim_registered_email(claimer, unclaimed_user, node)
         email = claimer.username
     else:
         raise HTTPError(http.BAD_REQUEST)
+
     return {
         'status': 'success',
         'email': email,

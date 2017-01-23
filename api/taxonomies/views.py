@@ -3,6 +3,7 @@ from rest_framework import generics, permissions as drf_permissions
 from api.base.views import JSONAPIBaseView
 from api.base.utils import get_object_or_error
 from api.base.filters import ODMFilterMixin
+from api.base.pagination import NoMaxPageSizePagination
 from api.base import permissions as base_permissions
 from api.taxonomies.serializers import TaxonomySerializer
 from website.project.taxonomies import Subject
@@ -47,6 +48,7 @@ class TaxonomyList(JSONAPIBaseView, generics.ListAPIView, ODMFilterMixin):
     required_read_scopes = [CoreScopes.ALWAYS_PUBLIC]
     required_write_scopes = [CoreScopes.NULL]
     serializer_class = TaxonomySerializer
+    pagination_class = NoMaxPageSizePagination
     view_category = 'taxonomies'
     view_name = 'taxonomy-list'
 
@@ -56,6 +58,14 @@ class TaxonomyList(JSONAPIBaseView, generics.ListAPIView, ODMFilterMixin):
 
     def get_queryset(self):
         return Subject.find(self.get_query_from_request())
+
+    # overrides FilterMixin
+    def postprocess_query_param(self, key, field_name, operation):
+        # Queries on 'parents' should be by object_id
+        if field_name == 'parents':
+            if operation['value'] not in (list(), tuple()):
+                operation['source_field_name'] = 'parents___id'
+
 
 class TaxonomyDetail(JSONAPIBaseView, generics.RetrieveAPIView):
     '''[PLOS taxonomy subject](http://journals.plos.org/plosone/browse/) instance. *Read-only*

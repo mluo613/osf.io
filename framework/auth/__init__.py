@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-
-from datetime import datetime
 import uuid
+
+from django.utils import timezone
 
 from framework import bcrypt
 from framework.auth import signals
@@ -44,7 +44,7 @@ def authenticate(user, access_token, response):
         'auth_user_fullname': user.fullname,
         'auth_user_access_token': access_token,
     })
-    user.date_last_login = datetime.utcnow()
+    user.date_last_login = timezone.now()
     user.clean_email_verifications()
     user.update_affiliated_institutions_by_email_domain()
     user.save()
@@ -68,6 +68,7 @@ def external_first_login_authenticate(user, response):
         'auth_user_fullname': user['fullname'],
         'auth_user_access_token': user['access_token'],
         'auth_user_external_first_login': True,
+        'service_url': user['service_url'],
     })
     response = create_session(response, data=data)
     return response
@@ -108,13 +109,15 @@ def register_unconfirmed(username, password, fullname, campaign=None):
     return user
 
 
-def get_or_create_user(fullname, address, is_spam=False):
-    """Get or create user by email address.
+def get_or_create_user(fullname, address, reset_password=True, is_spam=False):
+    """
+    Get or create user by fullname and email address.
 
-    :param str fullname: User full name
-    :param str address: User email address
-    :param bool is_spam: User flagged as potential spam
-    :return: Tuple of (user, created)
+    :param str fullname: user full name
+    :param str address: user email address
+    :param boolean reset_password: ask user to reset their password
+    :param bool is_spam: user flagged as potential spam
+    :return: tuple of (user, created)
     """
     user = get_user(email=address)
     if user:
@@ -122,7 +125,9 @@ def get_or_create_user(fullname, address, is_spam=False):
     else:
         password = str(uuid.uuid4())
         user = User.create_confirmed(address, password, fullname)
-        user.verification_key = generate_verification_key()
+        if password:
+            user.verification_key_v2 = generate_verification_key(verification_type='password')
         if is_spam:
-            user.system_tags.append('is_spam')
+            user.save()  # need to save in order to add a tag
+            user.add_system_tag('is_spam')
         return user, True

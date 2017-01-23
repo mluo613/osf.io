@@ -5,10 +5,13 @@ from api.base.serializers import (
     RelationshipField,
     RestrictedDictSerializer,
     LinksField,
-    is_anonymized
+    is_anonymized,
+    DateByVersion,
 )
 from website.project.model import Node
+from website.util import permissions as osf_permissions
 from framework.auth.core import User
+from website.preprints.model import PreprintService
 
 
 class NodeLogIdentifiersSerializer(RestrictedDictSerializer):
@@ -27,8 +30,15 @@ class NodeLogFileParamsSerializer(RestrictedDictSerializer):
     url = ser.URLField(read_only=True)
     addon = ser.CharField(read_only=True)
     node_url = ser.URLField(read_only=True, source='node.url')
-    node_title = ser.URLField(read_only=True, source='node.title')
+    node_title = ser.SerializerMethodField()
 
+    def get_node_title(self, obj):
+        user = self.context['request'].user
+        node_title = obj['node']['title']
+        node = Node.load(obj['node']['_id'])
+        if node.has_permission(user, osf_permissions.READ):
+            return node_title
+        return 'Private Component'
 
 class NodeLogParamsSerializer(RestrictedDictSerializer):
 
@@ -47,6 +57,7 @@ class NodeLogParamsSerializer(RestrictedDictSerializer):
     kind = ser.CharField(read_only=True)
     folder = ser.CharField(read_only=True)
     folder_name = ser.CharField(read_only=True)
+    license = ser.CharField(read_only=True, source='new_license')
     identifiers = NodeLogIdentifiersSerializer(read_only=True)
     institution = NodeLogInstitutionSerializer(read_only=True)
     old_page = ser.CharField(read_only=True)
@@ -56,6 +67,8 @@ class NodeLogParamsSerializer(RestrictedDictSerializer):
     params_project = ser.SerializerMethodField(read_only=True)
     path = ser.CharField(read_only=True)
     pointer = ser.DictField(read_only=True)
+    preprint = ser.CharField(read_only=True)
+    preprint_provider = ser.SerializerMethodField(read_only=True)
     previous_institution = NodeLogInstitutionSerializer(read_only=True)
     source = NodeLogFileParamsSerializer(read_only=True)
     study = ser.CharField(read_only=True)
@@ -122,6 +135,14 @@ class NodeLogParamsSerializer(RestrictedDictSerializer):
                 })
         return contributor_info
 
+    def get_preprint_provider(self, obj):
+        preprint_id = obj.get('preprint', None)
+        if preprint_id:
+            preprint = PreprintService.load(preprint_id)
+            if preprint:
+                provider = preprint.provider
+                return {'url': provider.external_url, 'name': provider.name}
+        return None
 
 class NodeLogSerializer(JSONAPISerializer):
 
@@ -133,7 +154,7 @@ class NodeLogSerializer(JSONAPISerializer):
     ]
 
     id = ser.CharField(read_only=True, source='_id')
-    date = ser.DateTimeField(read_only=True)
+    date = DateByVersion(read_only=True)
     action = ser.CharField(read_only=True)
     params = NodeLogParamsSerializer(read_only=True)
     links = LinksField({'self': 'get_absolute_url'})

@@ -1,8 +1,12 @@
+from __future__ import absolute_import
+
 from django import forms
 from django.contrib.auth.forms import UserCreationForm
 from django.contrib.admin.widgets import FilteredSelectMultiple
 from django.contrib.auth.models import Group
-from .models import MyUser
+
+from osf.models.user import OSFUser
+from admin.common_auth.models import AdminProfile
 
 
 class LoginForm(forms.Form):
@@ -22,12 +26,17 @@ class UserRegistrationForm(UserCreationForm):
     )
 
     class Meta:
-            model = MyUser
-            fields = ['password1', 'password2', 'first_name', 'last_name', 'email', 'is_active', 'is_staff',
-            'is_superuser', 'groups', 'user_permissions', 'last_login', 'group_perms', 'osf_id']
+            model = OSFUser
+            fields = ['given_name', 'username']
 
     def __init__(self, *args, **kwargs):
         super(UserRegistrationForm, self).__init__(*args, **kwargs)
         self.fields['first_name'].required = True
         self.fields['last_name'].required = True
         self.fields['osf_id'].required = True
+
+
+class DeskUserForm(forms.ModelForm):
+    class Meta:
+        model = AdminProfile
+        fields = ['desk_token', 'desk_token_secret']

@@ -8,6 +8,7 @@ var URI = require('URIjs');
 var bootbox = require('bootbox');
 var lodashGet = require('lodash.get');
 var KeenTracker = require('js/keen');
+var linkify = require('linkifyjs/html');
 
 
 // TODO: For some reason, this require is necessary for custom ko validators to work
@@ -106,6 +107,83 @@ var ajaxJSON = function(method, url, options) {
         $.extend(true, obj, savedAttributes);
     });
     return data;
+};
+
+/**
+ * Returns a promise of an array of ajaxJSON response objects
+ */
+var getAllPagesAjaxJSON = function(method, url, options) {
+    var responses = [];
+    var fetch = function(method, url, options) {
+        var request = ajaxJSON(method, url, options);
+        request.done(function(response) {
+            deferred.notify(response);
+            responses = responses.concat(response);
+            if (response.links.next !== null) {
+                fetch(method, response.links.next, options);
+            } else {
+                deferred.resolve(responses);
+            }
+        });
+        request.fail(function(xhr, status, error) {
+            deferred.reject(error);
+        });
+    };
+    var deferred = new $.Deferred();
+    fetch(method, url, options);
+    return deferred.promise();
+};
+
+/**
+ * Takes an array of response objects and returns a single object
+ * @param {Array of Objects}
+ * @return {Object data}
+ */
+var mergePagesAjaxJSON = function(pages) {
+    var mergedData = {};
+    $.each(pages, function(page) {
+        $.each(pages[page].data, function(n) {
+            var node = pages[page].data[n];
+            mergedData[node.id] = node;
+        });
+    });
+    return mergedData;
+};
+
+/**
+ * Takes an array of response objects and returns just the children from the parent
+ * @param {Array of Objects}, requires that api v2 call contained ``embed=parent``
+ * @return {Object data}
+ */
+var getAllNodeChildrenFromNodeList = function(parent, nodeList) {
+    var tree = {};
+    var re = /\/v2\/nodes\/(.*)\//;
+
+    $.each(nodeList, function(n) {
+        var parent = 'root';
+        if ('parent' in nodeList[n].relationships) {
+            parent = nodeList[n].relationships.parent.links.related.href.match(re)[1];
+        }
+        if (!(n in tree)) {
+            tree[n] = [];
+        }
+        if (!(parent in tree)) {
+            tree[parent] = [];
+        }
+        tree[parent].push(n);
+    });
+
+    var children = {};
+    var remaining = [parent];
+    while (remaining.length > 0) {
+        var node = remaining.pop();
+        for (var c in tree[node]){
+            var child = tree[node][c];
+            remaining.push(tree[child]);
+            children[child] = nodeList[child];    
+        }
+    }
+    return children;
 };
 
 /**
@@ -574,7 +652,7 @@ function humanFileSize(bytes, si) {
 /**
 *  returns a random name from this list to use as a confirmation string
 */
-var _confirmationString = function() {
+var getConfirmationString = function() {
     // TODO: Generate a random string here instead of using pre-set values
     //       per Jeff, use ~10 characters
     var scientists = [
@@ -653,7 +731,7 @@ var confirmDangerousAction = function (options) {
     //       sustained attention and will prevent the user from copy/pasting a
     //       random string.
 
-    var confirmationString = _confirmationString();
+    var confirmationString = getConfirmationString();
 
     // keep the users' callback for re-use; we'll pass ours to bootbox
     var callback = options.callback;
@@ -915,7 +993,6 @@ function getDomain(location) {
     return ret;
 }
 
-
 /**
  * Utility function to convert absolute URLs to relative urls
  * See:
@@ -934,12 +1011,25 @@ function toRelativeUrl(url, window) {
     return relative_url;
 }
 
+/**
+ * Utility function to render links in plain text to HTML a tags
+ * @param content {string} text to be converted
+ * @returns {string} linkified text
+ */
+function linkifyText(content) {
+    var linkifyOpts = { target: function (href, type) { return type === 'url' ? '_top' : null; } };
+    return linkify(content);
+}
+
 // Also export these to the global namespace so that these can be used in inline
 // JS. This is used on the /goodbye page at the moment.
 module.exports = window.$.osf = {
     postJSON: postJSON,
     putJSON: putJSON,
     ajaxJSON: ajaxJSON,
+    getAllPagesAjaxJSON: getAllPagesAjaxJSON,
+    mergePagesAjaxJSON: mergePagesAjaxJSON,
+    getAllNodeChildrenFromNodeList: getAllNodeChildrenFromNodeList,
     squashAPIAttributes: squashAPIAttributes,
     setXHRAuthorization: setXHRAuthorization,
     handleAddonApiHTTPError: handleAddonApiHTTPError,
@@ -976,5 +1066,7 @@ module.exports = window.$.osf = {
     extractContributorNamesFromAPIData: extractContributorNamesFromAPIData,
     onScrollToBottom: onScrollToBottom,
     getDomain: getDomain,
-    toRelativeUrl: toRelativeUrl
+    toRelativeUrl: toRelativeUrl,
+    linkifyText: linkifyText,
+    getConfirmationString: getConfirmationString
 };

@@ -1,6 +1,6 @@
 from nose.tools import *  # flake8: noqa
 from tests.base import OsfTestCase
-from tests.factories import InstitutionFactory
+from osf_tests.factories import InstitutionFactory
 
 from website.models import Institution, Node
 
@@ -52,6 +52,11 @@ class TestInstitution(OsfTestCase):
         inst = InstitutionFactory()
         inst.logo_name = None
         assert_is_none(inst.logo_path, None)
+
+    def test_institution_logo_path_rounded_corners(self):
+        inst = InstitutionFactory(logo_name='osf-shield.png')
+        expected_logo_path = '/static/img/institutions/shields-rounded-corners/osf-shield-rounded-corners.png'
+        assert_equal(inst.logo_path_rounded_corners, expected_logo_path)
 
     def test_institution_find(self):
         insts = list(Institution.find())

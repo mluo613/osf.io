@@ -127,20 +127,24 @@ def waterbutler_url_for(request_type, provider, path, node_id, token, obj_args=N
 def default_node_list_query():
     return (
         Q('is_deleted', 'ne', True) &
-        Q('is_collection', 'ne', True) &
-        Q('is_registration', 'ne', True)
+        Q('type', 'eq', 'osf.node')
     )
 
 
 def default_node_permission_query(user):
     permission_query = Q('is_public', 'eq', True)
     if not user.is_anonymous():
-        permission_query = (permission_query | Q('contributors', 'eq', user._id))
+        permission_query = (permission_query | Q('contributors', 'eq', user.pk))
 
     return permission_query
 
 def extend_querystring_params(url, params):
     return furl.furl(url).add(args=params).url
+
+def extend_querystring_if_key_exists(url, request, key):
+    if key in request.query_params.keys():
+        return extend_querystring_params(url, {key: request.query_params.get(key)})
+    return url
 
 def has_admin_scope(request):
     """ Helper function to determine if a request should be treated
@@ -157,3 +161,8 @@ def has_admin_scope(request):
         return False
 
     return set(ComposedScopes.ADMIN_LEVEL).issubset(normalize_scopes(token.attributes['accessTokenScope']))
+
+def is_deprecated(request_version, min_version, max_version):
+    if request_version < min_version or request_version > max_version:
+        return True
+    return False

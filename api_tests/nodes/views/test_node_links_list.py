@@ -8,7 +8,7 @@ from website.models import NodeLog
 from api.base.settings.defaults import API_BASE
 
 from tests.base import ApiTestCase
-from tests.factories import (
+from osf_tests.factories import (
     ProjectFactory,
     RegistrationFactory,
     AuthUserFactory
@@ -84,6 +84,12 @@ class TestNodeLinksList(ApiTestCase):
         res = self.app.get(self.public_url)
         res_json = res.json['data']
         assert_equal(len(res_json), original_length - 1)
+
+    def test_node_links_bad_version(self):
+        url = '{}?version=2.1'.format(self.public_url)
+        res = self.app.get(url, auth=self.user.auth, expect_errors=True)
+        assert_equal(res.status_code, 404)
+        assert_equal(res.json['errors'][0]['detail'], 'This feature is deprecated as of version 2.1')
 
 
 class TestNodeLinkCreate(ApiTestCase):
@@ -299,9 +305,9 @@ class TestNodeLinkCreate(ApiTestCase):
             'data': {
                 'type': 'nodes',
                 'relationships': {
-                    'node': {
+                    'nodes': {
                         'data': {
-                            'type': 'node',
+                            'type': 'Incorrect!',
                             'id': self.public_pointer_project._id
                         }
                     }

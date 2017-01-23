@@ -2,15 +2,15 @@
 
 import httplib
 import logging
-from datetime import datetime
 
+from django.db import transaction
+from django.utils import timezone
 from modularodm import Q
 from modularodm.exceptions import ModularOdmException
 
 from framework.auth import get_or_create_user
 from framework.exceptions import HTTPError
 from framework.flask import redirect
-from framework.transactions.context import TokuTransaction
 from framework.transactions.handlers import no_auto_transaction
 
 from website import settings
@@ -71,35 +71,39 @@ def add_poster_by_email(conference, message):
             fullname=message.sender_display,
         )
 
-    created = []
+    nodes_created = []
+    users_created = []
 
-    with TokuTransaction():
+    with transaction.atomic():
         user, user_created = get_or_create_user(
             message.sender_display,
             message.sender_email,
-            message.is_spam,
+            is_spam=message.is_spam,
         )
         if user_created:
-            created.append(user)
-            user.system_tags.append('osf4m')
+            user.save()  # need to save in order to access m2m fields (e.g. tags)
+            users_created.append(user)
+            user.add_system_tag('osf4m')
+            user.date_last_login = timezone.now()
+            user.save()
+            # must save the user first before accessing user._id
             set_password_url = web_url_for(
                 'reset_password_get',
-                verification_key=user.verification_key,
+                uid=user._id,
+                token=user.verification_key_v2['token'],
                 _absolute=True,
             )
-            user.date_last_login = datetime.utcnow()
-            user.save()
         else:
             set_password_url = None
 
         node, node_created = utils.get_or_create_node(message.subject, user)
         if node_created:
-            created.append(node)
-            node.system_tags.append('osf4m')
+            nodes_created.append(node)
+            node.add_system_tag('osf4m')
             node.save()
 
         utils.provision_node(conference, message, node, user)
-        utils.record_message(message, created)
+        utils.record_message(message, nodes_created, users_created)
     # Prevent circular import error
     from framework.auth import signals as auth_signals
     if user_created:
@@ -147,7 +151,7 @@ def _render_conference_node(node, idx, conf):
                 Q('is_file', 'eq', True)
             ).limit(1)
         ).wrapped()
-        view_and_download = record.get_download_count() + record.visit
+        download_count = record.get_download_count()
 
         download_url = node.web_url_for(
             'addon_view_or_download_file',
@@ -158,10 +162,10 @@ def _render_conference_node(node, idx, conf):
         )
     except StopIteration:
         download_url = ''
-        view_and_download = 0
+        download_count = 0
 
     author = node.visible_contributors[0]
-    tags = [tag._id for tag in node.tags]
+    tags = list(node.tags.values_list('name', flat=True))
 
     return {
         'id': idx,
@@ -170,7 +174,7 @@ def _render_conference_node(node, idx, conf):
         'author': author.family_name if author.family_name else author.fullname,
         'authorUrl': node.creator.url,
         'category': conf.field_names['submission1'] if conf.field_names['submission1'] in node.system_tags else conf.field_names['submission2'],
-        'download': view_and_download,
+        'download': download_count,
         'downloadUrl': download_url,
         'dateCreated': node.date_created.isoformat(),
         'confName': conf.name,
@@ -186,7 +190,7 @@ def conference_data(meeting):
         raise HTTPError(httplib.NOT_FOUND)
 
     nodes = Node.find(
-        Q('tags', 'iexact', meeting) &
+        Q('tags__name', 'iexact', meeting) &
         Q('is_public', 'eq', True) &
         Q('is_deleted', 'eq', False)
     )
@@ -200,6 +204,26 @@ def conference_data(meeting):
 
 def redirect_to_meetings(**kwargs):
     return redirect('/meetings/')
+
+
+def serialize_conference(conf):
+    return {
+        'active': conf.active,
+        'admins': list(conf.admins.all().values_list('guids___id', flat=True)),
+        'end_date': conf.end_date,
+        'endpoint': conf.endpoint,
+        'field_names': conf.field_names,
+        'info_url': conf.info_url,
+        'is_meeting': conf.is_meeting,
+        'location': conf.location,
+        'logo_url': conf.logo_url,
+        'name': conf.name,
+        'num_submissions': conf.num_submissions,
+        'poster': conf.poster,
+        'public_projects': conf.public_projects,
+        'start_date': conf.start_date,
+        'talk': conf.talk,
+    }
 
 
 def conference_results(meeting):
@@ -217,7 +241,7 @@ def conference_results(meeting):
     return {
         'data': data,
         'label': meeting,
-        'meeting': conf.to_storage(),
+        'meeting': serialize_conference(conf),
         # Needed in order to use base.mako namespace
         'settings': settings,
     }
@@ -232,12 +256,12 @@ def conference_submissions(**kwargs):
     #  TODO: Revisit this loop, there has to be a way to optimize it
     for conf in Conference.find():
         if (hasattr(conf, 'is_meeting') and (conf.is_meeting is False)):
-            break
+            continue
         # For efficiency, we filter by tag first, then node
         # instead of doing a single Node query
         projects = set()
 
-        tags = Tag.find(Q('lower', 'eq', conf.endpoint.lower())).get_keys()
+        tags = Tag.find(Q('name', 'iexact', conf.endpoint.lower())).values_list('pk', flat=True)
         nodes = Node.find(
             Q('tags', 'in', tags) &
             Q('is_public', 'eq', True) &
